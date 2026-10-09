@@ -5,8 +5,10 @@
 //! by canvas `measureText`, so layout matches what the browser draws.
 
 use js_sys::Function;
-use quill_core::{Align, Attr, Kind, Pos};
-use quill_layout::{layout, para_size, Caret, Layout, Measure, PageSetup, Rect, TextStyle};
+use quill_core::{Align, Attr, Kind, Page, Pos};
+use quill_layout::{
+    base_size, layout, para_size, Caret, Layout, Measure, PageSetup, Rect, TextStyle,
+};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -49,6 +51,16 @@ struct State {
     font: Option<String>,
     color: Option<u32>,
     align: &'static str,
+    /// Line spacing in 240ths (0 = default) and left indent in twips.
+    line_spacing: u16,
+    indent: u16,
+    paper: &'static str,
+}
+
+#[derive(Serialize)]
+struct PageBox {
+    w: f32,
+    h: f32,
 }
 
 #[derive(Serialize)]
@@ -57,6 +69,8 @@ struct Frame<'a> {
     caret: Caret,
     selection: Vec<Rect>,
     state: State,
+    /// Page size in CSS px.
+    page: PageBox,
 }
 
 fn kind_name(k: Kind) -> &'static str {
@@ -85,7 +99,6 @@ fn parse_kind(s: &str) -> Result<Kind, JsError> {
 #[wasm_bindgen]
 pub struct Editor {
     inner: quill_core::Editor,
-    page: PageSetup,
     measure: Option<Function>,
     /// Horizontal target kept across consecutive Up/Down presses.
     goal_x: Option<f32>,
@@ -97,7 +110,6 @@ impl Editor {
     pub fn new() -> Editor {
         Editor {
             inner: quill_core::Editor::default(),
-            page: PageSetup::LETTER,
             measure: None,
             goal_x: None,
         }
@@ -107,12 +119,26 @@ impl Editor {
         self.measure = Some(f);
     }
 
-    pub fn set_page(&mut self, width: f32, height: f32, margin: f32) {
-        self.page = PageSetup {
-            width,
-            height,
-            margin,
-        };
+    /// Paper size: "letter", "a4" or "legal" (margins reset to one inch).
+    pub fn set_paper(&mut self, name: &str) -> Result<(), JsError> {
+        self.inner.set_page(match name {
+            "letter" => Page::LETTER,
+            "a4" => Page::A4,
+            "legal" => Page::LEGAL,
+            other => return Err(JsError::new(&format!("unknown paper size: {other}"))),
+        });
+        Ok(())
+    }
+
+    /// Line spacing in 240ths of a line (240 single, 360 one-and-a-half);
+    /// 0 restores the default.
+    pub fn set_line_spacing(&mut self, line: u16) {
+        self.inner.set_line_spacing((line > 0).then_some(line));
+    }
+
+    /// Indent the selected paragraphs by `twips` (negative outdents).
+    pub fn indent(&mut self, twips: i32) {
+        self.inner.indent(twips);
     }
 
     fn layout(&self) -> Result<(Layout, Function), JsError> {
@@ -120,7 +146,8 @@ impl Editor {
             .measure
             .clone()
             .ok_or_else(|| JsError::new("set_measure must be called first"))?;
-        Ok((layout(self.inner.doc(), self.page, &JsMeasure(&f)), f))
+        let page = PageSetup::from_page(&self.inner.doc().page);
+        Ok((layout(self.inner.doc(), page, &JsMeasure(&f)), f))
     }
 
     // ---- files / text ----------------------------------------------------
@@ -424,10 +451,15 @@ impl Editor {
                 has_selection: self.inner.has_selection(),
                 in_table: self.inner.in_table(),
                 image_selected: self.inner.image_selected(),
-                size: fmt
-                    .size
-                    .unwrap_or_else(|| (para_size(self.inner.current_kind()) * 1.5).round() as u16),
-                font: fmt.font.as_deref().map(str::to_owned),
+                size: fmt.size.unwrap_or_else(|| {
+                    let px = para_size(self.inner.current_kind(), base_size(self.inner.doc()));
+                    (px * 1.5).round() as u16
+                }),
+                font: fmt
+                    .font
+                    .or_else(|| self.inner.doc().defaults.font.clone())
+                    .as_deref()
+                    .map(str::to_owned),
                 color: fmt.color,
                 align: match self.inner.current_align() {
                     Align::Left => "left",
@@ -435,6 +467,23 @@ impl Editor {
                     Align::Right => "right",
                     Align::Justify => "justify",
                 },
+                line_spacing: self.inner.current_paragraph().line_spacing.unwrap_or(0),
+                indent: self.inner.current_paragraph().indent_left.unwrap_or(0),
+                paper: match self.inner.doc().page {
+                    p if (p.width, p.height) == (Page::LETTER.width, Page::LETTER.height) => {
+                        "letter"
+                    }
+                    p if (p.width, p.height) == (Page::A4.width, Page::A4.height) => "a4",
+                    p if (p.width, p.height) == (Page::LEGAL.width, Page::LEGAL.height) => "legal",
+                    _ => "custom",
+                },
+            },
+            page: {
+                let p = PageSetup::from_page(&self.inner.doc().page);
+                PageBox {
+                    w: p.width,
+                    h: p.height,
+                }
             },
             layout: &l,
         };

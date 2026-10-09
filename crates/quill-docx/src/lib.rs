@@ -9,7 +9,12 @@ use std::io::{Cursor, Read, Write};
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
-use quill_core::{Align, Cell, Document, Format, Image, Kind, Paragraph, Run, OBJECT_CHAR};
+use quill_core::{
+    Align, Cell, Defaults, Document, Format, Image, Kind, Page, Paragraph, Run, OBJECT_CHAR,
+};
+
+mod styles;
+use styles::{apply_para_prop, apply_run_prop, PProps, RProps, Styles, Theme};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocxError {
@@ -46,7 +51,15 @@ pub fn read(bytes: &[u8]) -> Result<Document, DocxError> {
         None => HashMap::new(),
     };
     let media = read_media(&mut zip)?;
-    parse_document_xml(&xml, &numbering, &media)
+    let theme = match read_part(&mut zip, "word/theme/theme1.xml")? {
+        Some(t) => styles::parse_theme(&t)?,
+        None => Theme::default(),
+    };
+    let styles = match read_part(&mut zip, "word/styles.xml")? {
+        Some(x) => Styles::parse(&x, theme)?,
+        None => Styles::default(),
+    };
+    parse_document_xml(&xml, &numbering, &media, &styles)
 }
 
 /// Embedded images by relationship id: `rId → (mime, bytes)`.
@@ -102,7 +115,7 @@ fn read_media(zip: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<Media, DocxErr
     Ok(media)
 }
 
-fn attr(e: &BytesStart, local: &str) -> Option<String> {
+pub(crate) fn attr(e: &BytesStart, local: &str) -> Option<String> {
     e.attributes()
         .flatten()
         .find(|a| a.key.local_name().as_ref() == local)
@@ -110,7 +123,7 @@ fn attr(e: &BytesStart, local: &str) -> Option<String> {
 }
 
 /// `<w:b/>`-style toggles are on unless `w:val` says otherwise.
-fn toggle_on(e: &BytesStart) -> bool {
+pub(crate) fn toggle_on(e: &BytesStart) -> bool {
     !matches!(
         attr(e, "val").as_deref(),
         Some("false" | "0" | "off" | "none")
@@ -179,23 +192,80 @@ fn kind_from_style(id: &str) -> Option<Kind> {
     }
 }
 
+/// What a paragraph's style layers add up to (before direct run formatting).
+struct Resolved {
+    r: RProps,
+    p: PProps,
+    kind: Kind,
+}
+
+/// Quill's own default size for a paragraph kind (half-points), or the
+/// document default for body text.
+fn kind_default_size(kind: Kind, defaults: &Defaults) -> u16 {
+    match kind {
+        Kind::Heading(1) => 40,
+        Kind::Heading(2) => 32,
+        Kind::Heading(_) => 28,
+        _ => defaults.size.unwrap_or(24),
+    }
+}
+
+/// Flatten resolved properties into a run `Format`, leaving out anything
+/// Quill already implies (document defaults, heading size and weight).
+fn run_format(
+    res: &Resolved,
+    styles: &Styles,
+    run_style: Option<&str>,
+    direct: &RProps,
+    defaults: &Defaults,
+) -> Format {
+    let mut r = res.r.clone();
+    if let Some(id) = run_style {
+        r.overlay(&styles.char_props(id));
+    }
+    r.overlay(direct);
+    let heading = matches!(res.kind, Kind::Heading(_));
+    Format {
+        bold: r.bold.unwrap_or(false) && !heading,
+        italic: r.italic.unwrap_or(false),
+        underline: r.underline.unwrap_or(false),
+        image: None,
+        size: r
+            .size
+            .filter(|&s| s != kind_default_size(res.kind, defaults)),
+        font: r.font.filter(|f| defaults.font.as_ref() != Some(f)),
+        color: r.color,
+    }
+}
+
 fn parse_document_xml(
     xml: &str,
     numbering: &HashMap<u32, bool>,
     media: &Media,
+    styles: &Styles,
 ) -> Result<Document, DocxError> {
     let mut r = Reader::from_str(xml);
+    let defaults = styles.defaults();
+    let theme = &styles.theme;
     let mut paras: Vec<Paragraph> = Vec::new();
     let mut cur: Option<Paragraph> = None;
+    // Paragraph state: style layers, direct properties, and what they resolve to.
     let mut style_kind: Option<Kind> = None;
     let mut num_kind: Option<Kind> = None;
-    let mut fmt = Format::default();
-    let mut align = Align::Left;
+    let mut para_style: Option<String> = None;
+    let mut direct_p = PProps::default();
+    let mut in_ppr = false;
+    let mut resolved: Option<Resolved> = None;
+    // Run state.
+    let mut direct_r = RProps::default();
+    let mut run_style: Option<String> = None;
+    let mut run_fmt: Option<Format> = None;
     let mut in_text = false;
     // Table state. Only the outermost table is modelled; paragraphs of nested
     // tables are folded into the enclosing cell.
     let (mut depth, mut tables, mut row, mut col) = (0u32, 0u32, -1i32, -1i32);
     let mut cell: Option<Cell> = None;
+    let mut table_style: Option<String> = None;
     // Drawing state: display size (px) and the embedded image's relationship id.
     let mut images: Vec<Image> = Vec::new();
     let (mut in_drawing, mut extent, mut embed): (bool, Option<(u32, u32)>, Option<String>) =
@@ -204,45 +274,103 @@ fn parse_document_xml(
         v.and_then(|v| v.parse::<u64>().ok())
             .map(|v| (v / 9525) as u32)
     };
+    let mut page = Page::default();
+
+    // Resolve the current paragraph's style layers (once, when first needed).
+    macro_rules! resolve {
+        () => {{
+            if resolved.is_none() {
+                let (run_props, mut para_props) = styles.para_props(
+                    if depth > 0 {
+                        table_style.as_deref()
+                    } else {
+                        None
+                    },
+                    para_style.as_deref(),
+                );
+                para_props.overlay(&direct_p);
+                resolved = Some(Resolved {
+                    r: run_props,
+                    p: para_props,
+                    kind: num_kind.or(style_kind).unwrap_or(Kind::Normal),
+                });
+            }
+            resolved.as_ref().expect("just resolved")
+        }};
+    }
+    // The format for text added to the current run.
+    macro_rules! fmt_now {
+        () => {{
+            if run_fmt.is_none() {
+                let res = resolve!();
+                run_fmt = Some(run_format(
+                    res,
+                    styles,
+                    run_style.as_deref(),
+                    &direct_r,
+                    &defaults,
+                ));
+            }
+            run_fmt.clone().expect("just computed")
+        }};
+    }
+    // Build a finished paragraph from the resolved layers.
+    macro_rules! finish {
+        ($p:expr) => {{
+            let res = resolve!();
+            let list = res.kind.is_list();
+            let p: &mut Paragraph = $p;
+            p.cell = cell;
+            p.kind = res.kind;
+            p.align = res.p.align.unwrap_or(Align::Left);
+            p.space_before = res.p.before;
+            p.space_after = res.p.after;
+            p.line_spacing = res.p.line;
+            // List indents come from the numbering definition, which Quill models itself.
+            p.indent_left = if list {
+                None
+            } else {
+                res.p.left.filter(|&l| l > 0)
+            };
+            p.indent_first = if list {
+                None
+            } else {
+                res.p.first.filter(|&f| f != 0)
+            };
+        }};
+    }
+
     loop {
         match r.read_event()? {
             Event::Start(e) if e.local_name().as_ref() == "p" => {
                 cur = Some(Paragraph::default());
                 style_kind = None;
                 num_kind = None;
-                align = Align::Left;
+                para_style = None;
+                direct_p = PProps::default();
+                in_ppr = false;
+                resolved = None;
             }
-            Event::Empty(e) if e.local_name().as_ref() == "p" => paras.push(Paragraph {
-                cell,
-                ..Default::default()
-            }),
-            Event::Start(e) | Event::Empty(e)
-                if matches!(e.local_name().as_ref(), "rFonts" | "color" | "sz" | "jc") =>
-            {
-                match e.local_name().as_ref() {
-                    "rFonts" => {
-                        fmt.font = attr(&e, "ascii")
-                            .or_else(|| attr(&e, "hAnsi"))
-                            .filter(|n| !n.is_empty())
-                            .map(Into::into);
+            Event::Empty(e) if e.local_name().as_ref() == "p" => {
+                // An empty paragraph still carries its style's spacing.
+                style_kind = None;
+                num_kind = None;
+                para_style = None;
+                direct_p = PProps::default();
+                resolved = None;
+                let mut p = Paragraph::default();
+                finish!(&mut p);
+                paras.push(p);
+            }
+            Event::Start(e) | Event::Empty(e) if is_prop_element(&e) => {
+                if in_ppr {
+                    // Paragraph properties; run properties in here are the paragraph
+                    // mark's, which don't affect the text.
+                    if cur.is_some() {
+                        apply_para_prop(&e, &mut direct_p);
                     }
-                    "color" => {
-                        fmt.color = attr(&e, "val")
-                            .filter(|v| v.len() == 6)
-                            .and_then(|v| u32::from_str_radix(&v, 16).ok());
-                    }
-                    "sz" => fmt.size = attr(&e, "val").and_then(|v| v.parse().ok()),
-                    // `jc` also appears in table properties; only paragraphs count.
-                    _ => {
-                        if cur.is_some() {
-                            align = match attr(&e, "val").as_deref() {
-                                Some("center") => Align::Center,
-                                Some("right" | "end") => Align::Right,
-                                Some("both" | "distribute") => Align::Justify,
-                                _ => Align::Left,
-                            };
-                        }
-                    }
+                } else if cur.is_some() && apply_run_prop(&e, &mut direct_r, theme) {
+                    run_fmt = None;
                 }
             }
             Event::Start(e) => match e.local_name().as_ref() {
@@ -255,11 +383,13 @@ fn parse_document_xml(
                     extent = emu_to_px(attr(&e, "cx")).zip(emu_to_px(attr(&e, "cy")));
                 }
                 "blip" if in_drawing => embed = attr(&e, "embed"),
+                "pPr" => in_ppr = true,
                 "tbl" => {
                     depth += 1;
                     if depth == 1 {
                         tables += 1;
                         row = -1;
+                        table_style = None;
                     }
                 }
                 "tr" if depth == 1 => {
@@ -274,11 +404,20 @@ fn parse_document_xml(
                         col: col.max(0) as u16,
                     });
                 }
-                "r" => fmt = Format::default(),
-                "b" => fmt.bold = toggle_on(&e),
-                "i" => fmt.italic = toggle_on(&e),
-                "u" => fmt.underline = toggle_on(&e),
-                "pStyle" => style_kind = attr(&e, "val").and_then(|v| kind_from_style(&v)),
+                "r" => {
+                    direct_r = RProps::default();
+                    run_style = None;
+                    run_fmt = None;
+                }
+                "pStyle" => {
+                    para_style = attr(&e, "val");
+                    style_kind = para_style.as_deref().and_then(kind_from_style);
+                }
+                "tblStyle" if depth == 1 => table_style = attr(&e, "val"),
+                "rStyle" if !in_ppr => {
+                    run_style = attr(&e, "val");
+                    run_fmt = None;
+                }
                 "numId" => num_kind = numbering_kind(&e, numbering),
                 "t" => in_text = true,
                 _ => {}
@@ -288,20 +427,55 @@ fn parse_document_xml(
                     extent = emu_to_px(attr(&e, "cx")).zip(emu_to_px(attr(&e, "cy")));
                 }
                 "blip" if in_drawing => embed = attr(&e, "embed"),
-                "b" => fmt.bold = toggle_on(&e),
-                "i" => fmt.italic = toggle_on(&e),
-                "u" => fmt.underline = toggle_on(&e),
-                "pStyle" => style_kind = attr(&e, "val").and_then(|v| kind_from_style(&v)),
+                "pgSz" => {
+                    let dim = |k: &str, d: u32| {
+                        attr(&e, k)
+                            .and_then(|v| v.parse().ok())
+                            .filter(|&v| v > 0)
+                            .unwrap_or(d)
+                    };
+                    page.width = dim("w", page.width);
+                    page.height = dim("h", page.height);
+                }
+                "pgMar" => {
+                    let m = |k: &str, d: u32| {
+                        attr(&e, k)
+                            .and_then(|v| v.parse::<i32>().ok())
+                            .map_or(d, |v| v.max(0) as u32)
+                    };
+                    page.top = m("top", page.top);
+                    page.right = m("right", page.right);
+                    page.bottom = m("bottom", page.bottom);
+                    page.left = m("left", page.left);
+                }
+                "pStyle" => {
+                    para_style = attr(&e, "val");
+                    style_kind = para_style.as_deref().and_then(kind_from_style);
+                }
+                "tblStyle" if depth == 1 => table_style = attr(&e, "val"),
+                "rStyle" if !in_ppr => {
+                    run_style = attr(&e, "val");
+                    run_fmt = None;
+                }
                 "numId" => num_kind = numbering_kind(&e, numbering),
-                "tab" => push(&mut cur, "\t", &fmt),
-                "br" => push(&mut cur, "\n", &fmt),
+                "tab" => {
+                    let f = fmt_now!();
+                    push(&mut cur, "\t", &f);
+                }
+                "br" => {
+                    let f = fmt_now!();
+                    push(&mut cur, "\n", &f);
+                }
                 _ => {}
             },
-            Event::Text(t) if in_text => push(
-                &mut cur,
-                &t.xml_content(quick_xml::XmlVersion::Implicit1_0),
-                &fmt,
-            ),
+            Event::Text(t) if in_text => {
+                let f = fmt_now!();
+                push(
+                    &mut cur,
+                    &t.xml_content(quick_xml::XmlVersion::Implicit1_0),
+                    &f,
+                );
+            }
             Event::GeneralRef(g) if in_text => {
                 let s = match g.as_ref() {
                     "amp" => "&",
@@ -311,10 +485,12 @@ fn parse_document_xml(
                     "apos" => "'",
                     _ => "",
                 };
-                push(&mut cur, s, &fmt);
+                let f = fmt_now!();
+                push(&mut cur, s, &f);
             }
             Event::End(e) => match e.local_name().as_ref() {
                 "t" => in_text = false,
+                "pPr" => in_ppr = false,
                 "drawing" => {
                     in_drawing = false;
                     let found = embed.take().and_then(|rid| media.get(&rid));
@@ -335,14 +511,12 @@ fn parse_document_xml(
                     depth = depth.saturating_sub(1);
                     if depth == 0 {
                         cell = None;
+                        table_style = None;
                     }
                 }
                 "p" => {
                     if let Some(mut p) = cur.take() {
-                        p.cell = cell;
-                        p.align = align;
-                        // A list numbering wins over a plain style.
-                        p.kind = num_kind.or(style_kind).unwrap_or(Kind::Normal);
+                        finish!(&mut p);
                         paras.push(p);
                     }
                 }
@@ -354,8 +528,25 @@ fn parse_document_xml(
     }
     let mut doc = Document::from_paragraphs(paras);
     doc.images = images;
+    doc.page = page;
+    // Quill's built-in body font stands for "no explicit default".
+    doc.defaults = Defaults {
+        font: defaults.font.filter(|f| &**f != DEFAULT_FONT),
+        size: defaults.size.filter(|&s| s != 24),
+    };
     Ok(doc)
 }
+
+/// Elements handled as run/paragraph properties (context decides which).
+fn is_prop_element(e: &BytesStart) -> bool {
+    matches!(
+        e.local_name().as_ref(),
+        "rFonts" | "sz" | "color" | "b" | "i" | "u" | "jc" | "spacing" | "ind"
+    )
+}
+
+/// The font Quill's renderer uses when a document names none.
+pub const DEFAULT_FONT: &str = "Georgia";
 
 fn numbering_kind(e: &BytesStart, numbering: &HashMap<u32, bool>) -> Option<Kind> {
     let id: u32 = attr(e, "val")?.parse().ok()?;
@@ -517,11 +708,40 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
             Align::Right => "<w:jc w:val=\"right\"/>",
             Align::Justify => "<w:jc w:val=\"both\"/>",
         };
-        let ppr = if style_and_num.is_empty() && jc.is_empty() {
-            String::new()
-        } else {
-            format!("<w:pPr>{style_and_num}{jc}</w:pPr>")
-        };
+        let mut spacing = String::new();
+        if p.space_before.is_some() || p.space_after.is_some() || p.line_spacing.is_some() {
+            spacing.push_str("<w:spacing");
+            if let Some(v) = p.space_before {
+                spacing.push_str(&format!(" w:before=\"{v}\""));
+            }
+            if let Some(v) = p.space_after {
+                spacing.push_str(&format!(" w:after=\"{v}\""));
+            }
+            if let Some(v) = p.line_spacing {
+                spacing.push_str(&format!(" w:line=\"{v}\" w:lineRule=\"auto\""));
+            }
+            spacing.push_str("/>");
+        }
+        // List indents belong to the numbering definition.
+        let mut ind = String::new();
+        if !p.kind.is_list() && (p.indent_left.is_some() || p.indent_first.is_some()) {
+            ind.push_str("<w:ind");
+            if let Some(v) = p.indent_left {
+                ind.push_str(&format!(" w:left=\"{v}\""));
+            }
+            match p.indent_first {
+                Some(f) if f < 0 => ind.push_str(&format!(" w:hanging=\"{}\"", -(f as i32))),
+                Some(f) => ind.push_str(&format!(" w:firstLine=\"{f}\"")),
+                None => {}
+            }
+            ind.push_str("/>");
+        }
+        let ppr =
+            if style_and_num.is_empty() && spacing.is_empty() && ind.is_empty() && jc.is_empty() {
+                String::new()
+            } else {
+                format!("<w:pPr>{style_and_num}{spacing}{ind}{jc}</w:pPr>")
+            };
         prev_numbered = p.kind == Kind::Numbered;
         body.push_str("<w:p>");
         body.push_str(&ppr);
@@ -552,8 +772,14 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
     if open_table.is_some() {
         body.push_str("</w:tc></w:tr></w:tbl><w:p/>"); // Word requires a paragraph after a table
     }
-    let document =
-        format!("{XML_DECL}<w:document xmlns:w=\"{NS_W}\" xmlns:r=\"{NS_R}\" xmlns:wp=\"{NS_WP}\"><w:body>{body}</w:body></w:document>");
+    let pg = &doc.page;
+    let sect = format!(
+        "<w:sectPr><w:pgSz w:w=\"{}\" w:h=\"{}\"/><w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/></w:sectPr>",
+        pg.width, pg.height, pg.top, pg.right, pg.bottom, pg.left
+    );
+    let document = format!(
+        "{XML_DECL}<w:document xmlns:w=\"{NS_W}\" xmlns:r=\"{NS_R}\" xmlns:wp=\"{NS_WP}\"><w:body>{body}{sect}</w:body></w:document>"
+    );
 
     let mut nums = String::new();
     for i in 0..numbered_lists {
@@ -572,12 +798,18 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
     let heading = |n: u8, half_pts: u32| {
         format!(
             "<w:style w:type=\"paragraph\" w:styleId=\"Heading{n}\"><w:name w:val=\"heading {n}\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
-<w:pPr><w:keepNext/><w:spacing w:before=\"240\" w:after=\"80\"/><w:outlineLvl w:val=\"{}\"/></w:pPr><w:rPr><w:b/><w:sz w:val=\"{half_pts}\"/></w:rPr></w:style>",
+<w:pPr><w:keepNext/><w:outlineLvl w:val=\"{}\"/></w:pPr><w:rPr><w:b/><w:sz w:val=\"{half_pts}\"/></w:rPr></w:style>",
             n - 1
         )
     };
+    // Body text defaults. Without them Word falls back to 10 pt Times New Roman.
+    let font = esc_attr(doc.defaults.font.as_deref().unwrap_or(DEFAULT_FONT));
+    let size = doc.defaults.size.unwrap_or(24);
+    let doc_defaults = format!(
+        "<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii=\"{font}\" w:hAnsi=\"{font}\" w:cs=\"{font}\"/><w:sz w:val=\"{size}\"/><w:szCs w:val=\"{size}\"/></w:rPr></w:rPrDefault></w:docDefaults>"
+    );
     let styles = format!(
-        "{XML_DECL}<w:styles xmlns:w=\"{NS_W}\">\
+        "{XML_DECL}<w:styles xmlns:w=\"{NS_W}\">{doc_defaults}\
 <w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:qFormat/></w:style>{}{}{}\
 <w:style w:type=\"paragraph\" w:styleId=\"ListParagraph\"><w:name w:val=\"List Paragraph\"/><w:basedOn w:val=\"Normal\"/><w:qFormat/><w:pPr><w:ind w:left=\"720\"/></w:pPr></w:style></w:styles>",
         heading(1, 40),
@@ -716,7 +948,8 @@ mod tests {
     #[test]
     fn toggle_off_values_are_respected() {
         let xml = r#"<w:document xmlns:w="x"><w:body><w:p><w:r><w:rPr><w:b w:val="0"/><w:u w:val="none"/></w:rPr><w:t>a</w:t></w:r></w:p></w:body></w:document>"#;
-        let d = parse_document_xml(xml, &HashMap::new(), &Media::new()).unwrap();
+        let d =
+            parse_document_xml(xml, &HashMap::new(), &Media::new(), &Styles::default()).unwrap();
         assert_eq!(d.paragraphs[0].runs[0].format, Format::default());
     }
 
@@ -731,7 +964,8 @@ mod tests {
     #[test]
     fn empty_paragraphs_survive() {
         let xml = r#"<w:document xmlns:w="x"><w:body><w:p/><w:p><w:r><w:t>a</w:t></w:r></w:p></w:body></w:document>"#;
-        let d = parse_document_xml(xml, &HashMap::new(), &Media::new()).unwrap();
+        let d =
+            parse_document_xml(xml, &HashMap::new(), &Media::new(), &Styles::default()).unwrap();
         assert_eq!(d.paragraphs.len(), 2);
     }
 
@@ -792,7 +1026,8 @@ mod tests {
     fn nested_table_paragraphs_fold_into_outer_cell() {
         let xml = r#"<w:document xmlns:w="x"><w:body><w:tbl><w:tr><w:tc><w:p><w:r><w:t>outer</w:t></w:r></w:p>
             <w:tbl><w:tr><w:tc><w:p><w:r><w:t>inner</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:tc><w:tc><w:p><w:r><w:t>next</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>"#;
-        let d = parse_document_xml(xml, &HashMap::new(), &Media::new()).unwrap();
+        let d =
+            parse_document_xml(xml, &HashMap::new(), &Media::new(), &Styles::default()).unwrap();
         let cells: Vec<_> = d
             .paragraphs
             .iter()
@@ -862,7 +1097,7 @@ mod tests {
             </w:p></w:body></w:document>"#;
         let mut media = Media::new();
         media.insert("rId9".into(), ("image/png".into(), png_bytes(5)));
-        let d = parse_document_xml(xml, &HashMap::new(), &media).unwrap();
+        let d = parse_document_xml(xml, &HashMap::new(), &media, &Styles::default()).unwrap();
         assert_eq!(d.images.len(), 1, "unresolvable relationship is skipped");
         assert_eq!((d.images[0].width, d.images[0].height), (100, 50));
         assert_eq!(d.paragraphs[0].len(), 2);
@@ -908,7 +1143,8 @@ mod tests {
             <w:r><w:rPr><w:rFonts w:hAnsi="Calibri"/><w:color w:val="auto"/><w:sz w:val="22"/></w:rPr><w:t>x</w:t></w:r></w:p>
           <w:tbl><w:tblPr><w:jc w:val="center"/></w:tblPr><w:tr><w:tc><w:p><w:r><w:t>c</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         </w:body></w:document>"#;
-        let d = parse_document_xml(xml, &HashMap::new(), &Media::new()).unwrap();
+        let d =
+            parse_document_xml(xml, &HashMap::new(), &Media::new(), &Styles::default()).unwrap();
         let p = &d.paragraphs[0];
         assert_eq!(p.align, Align::Right);
         let f = &p.runs[0].format;
@@ -920,6 +1156,241 @@ mod tests {
             d.paragraphs[1].align,
             Align::Left,
             "table jc must not leak into the cell paragraph"
+        );
+    }
+
+    /// Build a .docx from raw parts.
+    fn package(parts: &[(&str, &str)]) -> Vec<u8> {
+        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, data) in parts {
+            z.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            z.write_all(data.as_bytes()).unwrap();
+        }
+        z.finish().unwrap().into_inner()
+    }
+
+    const THEME: &str = r#"<a:theme xmlns:a="a"><a:themeElements><a:fontScheme>
+        <a:majorFont><a:latin typeface="Calibri Light"/><a:ea typeface=""/></a:majorFont>
+        <a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/></a:minorFont>
+        </a:fontScheme></a:themeElements></a:theme>"#;
+
+    // What Word typically writes: theme fonts, 11pt, 8pt after, 1.08 lines.
+    const WORD_STYLES: &str = r#"<w:styles xmlns:w="w">
+      <w:docDefaults>
+        <w:rPrDefault><w:rPr><w:rFonts w:asciiTheme="minorHAnsi" w:hAnsiTheme="minorHAnsi"/><w:sz w:val="22"/></w:rPr></w:rPrDefault>
+        <w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="259" w:lineRule="auto"/></w:pPr></w:pPrDefault>
+      </w:docDefaults>
+      <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+      <w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/>
+        <w:pPr><w:keepNext/><w:spacing w:before="240" w:after="0"/><w:rPr><w:sz w:val="99"/></w:rPr></w:pPr>
+        <w:rPr><w:rFonts w:asciiTheme="majorHAnsi"/><w:color w:val="2F5496"/><w:sz w:val="32"/></w:rPr></w:style>
+      <w:style w:type="paragraph" w:styleId="Quote"><w:basedOn w:val="Normal"/>
+        <w:pPr><w:ind w:left="864" w:right="864"/><w:jc w:val="center"/></w:pPr><w:rPr><w:i/></w:rPr></w:style>
+      <w:style w:type="paragraph" w:styleId="Loop1"><w:basedOn w:val="Loop2"/><w:rPr><w:sz w:val="50"/></w:rPr></w:style>
+      <w:style w:type="paragraph" w:styleId="Loop2"><w:basedOn w:val="Loop1"/><w:rPr><w:b/></w:rPr></w:style>
+      <w:style w:type="character" w:styleId="Strong"><w:rPr><w:b/><w:color w:val="C00000"/></w:rPr></w:style>
+      <w:style w:type="table" w:styleId="TableGrid"><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr>
+        <w:tblStylePr w:type="firstRow"><w:pPr><w:spacing w:after="999"/></w:pPr><w:rPr><w:b/></w:rPr></w:tblStylePr></w:style>
+    </w:styles>"#;
+
+    fn word_like(body: &str) -> Document {
+        let doc = format!(
+            r#"<w:document xmlns:w="w"><w:body>{body}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>
+               <w:pgMar w:top="1134" w:right="850" w:bottom="1701" w:left="1417" w:header="708" w:footer="708"/></w:sectPr></w:body></w:document>"#
+        );
+        let bytes = package(&[
+            ("word/document.xml", &doc),
+            ("word/styles.xml", WORD_STYLES),
+            ("word/theme/theme1.xml", THEME),
+        ]);
+        read(&bytes).unwrap()
+    }
+
+    #[test]
+    fn document_defaults_page_and_theme_fonts_are_imported() {
+        let d = word_like(r#"<w:p><w:r><w:t>plain</w:t></w:r></w:p>"#);
+        assert_eq!(
+            d.defaults.font.as_deref(),
+            Some("Calibri"),
+            "minor theme font"
+        );
+        assert_eq!(d.defaults.size, Some(22));
+        let p = &d.paragraphs[0];
+        assert_eq!(
+            (p.space_after, p.space_before, p.line_spacing),
+            (Some(160), None, Some(259))
+        );
+        // Plain text stays plain: defaults are not repeated on every run.
+        assert_eq!(p.runs[0].format, Format::default());
+        assert_eq!(
+            d.page,
+            Page {
+                width: 11906,
+                height: 16838,
+                top: 1134,
+                right: 850,
+                bottom: 1701,
+                left: 1417
+            }
+        );
+    }
+
+    #[test]
+    fn paragraph_styles_inherit_and_direct_formatting_wins() {
+        let d = word_like(
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Title</w:t></w:r></w:p>
+               <w:p><w:pPr><w:pStyle w:val="Quote"/><w:jc w:val="right"/></w:pPr><w:r><w:t>said</w:t></w:r></w:p>
+               <w:p><w:r><w:rPr><w:sz w:val="40"/><w:i w:val="0"/></w:rPr><w:t>big</w:t></w:r></w:p>"#,
+        );
+        let h = &d.paragraphs[0];
+        assert_eq!(h.kind, Kind::Heading(1));
+        // basedOn Normal → docDefaults line spacing; style's own before/after win.
+        assert_eq!(
+            (h.space_before, h.space_after, h.line_spacing),
+            (Some(240), Some(0), Some(259))
+        );
+        let f = &h.runs[0].format;
+        assert_eq!(f.color, Some(0x2F5496));
+        assert_eq!(f.font.as_deref(), Some("Calibri Light"), "major theme font");
+        assert_eq!(
+            f.size,
+            Some(32),
+            "16pt differs from Quill's 20pt heading default"
+        );
+        assert!(!f.bold, "Quill headings are bold by kind, not by run");
+
+        let q = &d.paragraphs[1];
+        assert_eq!(q.kind, Kind::Normal);
+        assert_eq!(q.indent_left, Some(864));
+        assert_eq!(
+            q.align,
+            Align::Right,
+            "direct jc overrides the style's centre"
+        );
+        assert!(
+            q.runs[0].format.italic,
+            "style's run properties apply to its text"
+        );
+
+        let big = &d.paragraphs[2].runs[0].format;
+        assert_eq!(big.size, Some(40));
+    }
+
+    #[test]
+    fn character_styles_and_toggles_layer_correctly() {
+        let d = word_like(
+            r#"<w:p><w:pPr><w:pStyle w:val="Quote"/></w:pPr>
+                 <w:r><w:rPr><w:rStyle w:val="Strong"/></w:rPr><w:t>a</w:t></w:r>
+                 <w:r><w:rPr><w:rStyle w:val="Strong"/><w:b w:val="0"/><w:i w:val="false"/></w:rPr><w:t>b</w:t></w:r></w:p>"#,
+        );
+        let runs = &d.paragraphs[0].runs;
+        assert_eq!(runs.len(), 2);
+        assert!(
+            runs[0].format.bold && runs[0].format.italic,
+            "char style + paragraph style"
+        );
+        assert_eq!(runs[0].format.color, Some(0xC00000));
+        assert!(
+            !runs[1].format.bold && !runs[1].format.italic,
+            "direct values beat both styles"
+        );
+        assert_eq!(runs[1].format.color, Some(0xC00000));
+    }
+
+    #[test]
+    fn table_styles_set_cell_spacing_but_not_conditional_formatting() {
+        let d = word_like(
+            r#"<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/></w:tblPr><w:tr>
+                 <w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+               <w:p><w:r><w:t>after</w:t></w:r></w:p>"#,
+        );
+        let c = &d.paragraphs[0];
+        assert!(c.cell.is_some());
+        assert_eq!((c.space_after, c.line_spacing), (Some(0), Some(240)));
+        assert!(
+            !c.runs[0].format.bold,
+            "firstRow conditional formatting is ignored"
+        );
+        assert_eq!(
+            d.paragraphs[1].space_after,
+            Some(160),
+            "text outside the table is unaffected"
+        );
+    }
+
+    #[test]
+    fn style_cycles_and_unknown_styles_do_not_hang_or_panic() {
+        let d = word_like(
+            r#"<w:p><w:pPr><w:pStyle w:val="Loop1"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>
+               <w:p><w:pPr><w:pStyle w:val="NoSuchStyle"/></w:pPr><w:r><w:rPr><w:rStyle w:val="Nope"/></w:rPr><w:t>y</w:t></w:r></w:p>"#,
+        );
+        assert_eq!(d.paragraphs.len(), 2);
+        assert_eq!(d.paragraphs[0].runs[0].format.size, Some(50));
+    }
+
+    #[test]
+    fn missing_styles_theme_and_section_fall_back_to_defaults() {
+        let bytes = package(&[(
+            "word/document.xml",
+            r#"<w:document xmlns:w="w"><w:body><w:p><w:r><w:t>hi</w:t></w:r></w:p></w:body></w:document>"#,
+        )]);
+        let d = read(&bytes).unwrap();
+        assert_eq!(d.page, Page::default());
+        assert_eq!(d.defaults, Defaults::default());
+        assert_eq!(d.paragraphs[0].space_after, None);
+    }
+
+    #[test]
+    fn spacing_indent_page_and_defaults_round_trip() {
+        let mut d = Document::from_paragraphs(vec![
+            Paragraph::plain("spaced"),
+            Paragraph::plain("hanging"),
+            Paragraph::plain("first line"),
+            Paragraph::plain("item").with_kind(Kind::Bullet),
+        ]);
+        d.paragraphs[0].space_before = Some(120);
+        d.paragraphs[0].space_after = Some(0);
+        d.paragraphs[0].line_spacing = Some(360);
+        d.paragraphs[1].indent_left = Some(720);
+        d.paragraphs[1].indent_first = Some(-360);
+        d.paragraphs[2].indent_first = Some(240);
+        d.paragraphs[3].indent_left = Some(999); // ignored for lists
+        d.page = Page::A4;
+        d.page.left = 1700;
+        d.defaults = Defaults {
+            font: Some("Calibri".into()),
+            size: Some(22),
+        };
+        let bytes = write(&d).unwrap();
+        let mut back = read(&bytes).unwrap();
+        d.paragraphs[3].indent_left = None;
+        assert_eq!(back, d);
+        // Quill's own default font is not written back as an explicit default.
+        back.defaults = Defaults::default();
+        assert_eq!(
+            read(&write(&back).unwrap()).unwrap().defaults,
+            Defaults::default()
+        );
+
+        let mut z = zip::ZipArchive::new(Cursor::new(&bytes[..])).unwrap();
+        let xml = read_part(&mut z, "word/document.xml").unwrap().unwrap();
+        assert!(xml
+            .contains(r#"<w:spacing w:before="120" w:after="0" w:line="360" w:lineRule="auto"/>"#));
+        assert!(xml.contains(r#"<w:ind w:left="720" w:hanging="360"/>"#));
+        assert!(xml.contains(r#"<w:ind w:firstLine="240"/>"#));
+        assert!(
+            xml.contains(r#"<w:pgSz w:w="11906" w:h="16838"/>"#)
+                && xml.contains(r#"w:left="1700""#)
+        );
+        assert!(
+            xml.find("<w:sectPr>").unwrap() > xml.rfind("</w:p>").unwrap(),
+            "sectPr closes the body"
+        );
+        let styles = read_part(&mut z, "word/styles.xml").unwrap().unwrap();
+        assert!(
+            styles.contains(r#"<w:rFonts w:ascii="Calibri""#)
+                && styles.contains(r#"<w:sz w:val="22"/>"#)
         );
     }
 }

@@ -92,6 +92,54 @@ impl Format {
     }
 }
 
+/// Page size and margins in twips (1/1440 inch). The default is US Letter
+/// with one-inch margins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Page {
+    pub width: u32,
+    pub height: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+    pub left: u32,
+}
+
+impl Page {
+    pub const LETTER: Page = Page::new(12240, 15840);
+    pub const A4: Page = Page::new(11906, 16838);
+    pub const LEGAL: Page = Page::new(12240, 20160);
+
+    const fn new(width: u32, height: u32) -> Page {
+        Page {
+            width,
+            height,
+            top: 1440,
+            right: 1440,
+            bottom: 1440,
+            left: 1440,
+        }
+    }
+
+    /// Twips to CSS px (96 per inch).
+    pub fn px(twips: u32) -> f32 {
+        twips as f32 / 15.0
+    }
+}
+
+impl Default for Page {
+    fn default() -> Self {
+        Page::LETTER
+    }
+}
+
+/// Document-wide text defaults; runs only store what differs from these.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Defaults {
+    pub font: Option<Arc<str>>,
+    /// Half-points.
+    pub size: Option<u16>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Align {
     #[default]
@@ -161,6 +209,20 @@ pub struct Paragraph {
     pub kind: Kind,
     #[serde(default)]
     pub align: Align,
+    /// Space above/below in twips; `None` is Quill's default (none above, 8 px below).
+    #[serde(default)]
+    pub space_before: Option<u16>,
+    #[serde(default)]
+    pub space_after: Option<u16>,
+    /// Line spacing in 240ths of a line (240 = single); `None` is Quill's default.
+    #[serde(default)]
+    pub line_spacing: Option<u16>,
+    /// Left indent in twips (ignored for list items).
+    #[serde(default)]
+    pub indent_left: Option<u16>,
+    /// First-line indent in twips; negative hangs the first line.
+    #[serde(default)]
+    pub indent_first: Option<i16>,
     pub runs: Vec<Run>,
     #[serde(default)]
     pub cell: Option<Cell>,
@@ -215,14 +277,24 @@ impl Paragraph {
         last.cloned().unwrap_or_default()
     }
 
-    /// Split into (before, after) at `offset`; both keep this paragraph's kind, alignment and cell.
-    fn split_at(&self, offset: usize) -> (Paragraph, Paragraph) {
-        let mk = || Paragraph {
+    /// A copy with the same paragraph properties but no text.
+    fn shell(&self) -> Paragraph {
+        Paragraph {
             kind: self.kind,
             align: self.align,
+            space_before: self.space_before,
+            space_after: self.space_after,
+            line_spacing: self.line_spacing,
+            indent_left: self.indent_left,
+            indent_first: self.indent_first,
             runs: vec![],
             cell: self.cell,
-        };
+        }
+    }
+
+    /// Split into (before, after) at `offset`; both keep this paragraph's properties.
+    fn split_at(&self, offset: usize) -> (Paragraph, Paragraph) {
+        let mk = || self.shell();
         let (mut a, mut b) = (mk(), mk());
         let mut pos = 0;
         for r in &self.runs {
@@ -270,6 +342,10 @@ pub struct Document {
     pub paragraphs: Vec<Paragraph>,
     #[serde(default)]
     pub images: Vec<Image>,
+    #[serde(default)]
+    pub page: Page,
+    #[serde(default)]
+    pub defaults: Defaults,
 }
 
 impl Default for Document {
@@ -277,6 +353,8 @@ impl Default for Document {
         Self {
             paragraphs: vec![Paragraph::default()],
             images: vec![],
+            page: Page::default(),
+            defaults: Defaults::default(),
         }
     }
 }
@@ -313,6 +391,8 @@ impl Document {
         Self {
             paragraphs,
             images: vec![],
+            page: Page::default(),
+            defaults: Defaults::default(),
         }
     }
 

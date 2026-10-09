@@ -1,7 +1,10 @@
 import init, { Editor } from "./pkg/quill_wasm.js";
 
-const PAGE = { w: 816, h: 1056, margin: 72 };
 const FONT_FAMILY = "Georgia, 'Times New Roman', serif";
+// Office documents name fonts that browsers often lack; fall back by style.
+const MONO = /^(courier|consolas|menlo|monaco|lucida console|cascadia|source code|fira (code|mono))/i;
+const SERIF = /^(times|cambria|georgia|garamond|palatino|book antiqua|century|baskerville|bookman|constantia|minion|sitka)/i;
+const generic = (name) => (MONO.test(name) ? "monospace" : SERIF.test(name) ? "serif" : "sans-serif");
 const TEXT_COLOR = "#1f2328";
 const SELECTION_COLOR = "rgba(37, 99, 235, 0.3)";
 const CARET_COLOR = "#2563eb";
@@ -13,7 +16,7 @@ const statusEl = $("status");
 const mctx = document.createElement("canvas").getContext("2d");
 
 const fontFor = (bold, italic, size, font) =>
-  `${italic ? "italic " : ""}${bold ? "bold " : ""}${size}px ${font ? `"${font}", ` : ""}${FONT_FAMILY}`;
+  `${italic ? "italic " : ""}${bold ? "bold " : ""}${size}px ${font ? `"${font}", ${generic(font)}` : FONT_FAMILY}`;
 const cssColor = (rgb) => (rgb == null ? TEXT_COLOR : `#${rgb.toString(16).padStart(6, "0")}`);
 function measure(text, bold, italic, size, font) {
   mctx.font = fontFor(bold, italic, size, font);
@@ -23,7 +26,6 @@ function measure(text, bold, italic, size, font) {
 await init();
 const editor = new Editor();
 editor.set_measure(measure);
-editor.set_page(PAGE.w, PAGE.h, PAGE.margin);
 editor.load_text(`# Welcome to Quill
 Quill is an open-source office suite written in Rust and compiled to WebAssembly. This page is a live editor: click anywhere, type, drag to select, and try the toolbar.
 ## What works today
@@ -43,17 +45,27 @@ let blink = true;
 let canvases = [];
 const dpr = window.devicePixelRatio || 1;
 
-function ensureCanvases(n) {
+let pageSize = { w: 816, h: 1056 };
+
+/** Keep one canvas per page, all sized to the document's page. */
+function ensureCanvases(n, size) {
+  const changed = size.w !== pageSize.w || size.h !== pageSize.h;
+  pageSize = size;
   while (canvases.length < n) {
     const c = document.createElement("canvas");
-    c.width = PAGE.w * dpr; c.height = PAGE.h * dpr;
-    c.style.width = PAGE.w + "px"; c.style.height = PAGE.h + "px";
     c.dataset.page = String(canvases.length);
     c.setAttribute("role", "presentation");
+    c.width = 0; // sized below
     pagesEl.appendChild(c);
     canvases.push(c);
   }
   while (canvases.length > n) canvases.pop().remove();
+  for (const c of canvases) {
+    if (changed || !c.width) {
+      c.width = Math.round(size.w * dpr); c.height = Math.round(size.h * dpr);
+      c.style.width = size.w + "px"; c.style.height = size.h + "px";
+    }
+  }
 }
 
 // Decoded images, keyed by the pixel data's uid (stable across undo/redo).
@@ -83,7 +95,7 @@ function paint() {
   canvases.forEach((canvas, p) => {
     const ctx = canvas.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, PAGE.w, PAGE.h);
+    ctx.clearRect(0, 0, pageSize.w, pageSize.h);
     ctx.strokeStyle = "#9aa0a6";
     ctx.lineWidth = 1;
     for (const c of frame.layout.cells) if (c.page === p) ctx.strokeRect(c.x + 0.5, c.y + 0.5, c.w, c.h);
@@ -127,6 +139,9 @@ function updateToolbar() {
   const s = frame.state;
   for (const b of document.querySelectorAll("[data-attr]")) b.setAttribute("aria-pressed", String(s[b.dataset.attr]));
   for (const b of document.querySelectorAll("[data-kind]")) b.setAttribute("aria-pressed", String(s.kind === b.dataset.kind));
+  $("paper").value = s.paper === "custom" ? "" : s.paper;
+  $("spacing").value = String(s.line_spacing);
+  if (!$("spacing").value) $("spacing").value = "0";
   $("font").value = s.font ?? "";
   if (s.font && $("font").value !== s.font) $("font").add(new Option(s.font, s.font, false, true));
   const pt = String(s.size / 2);
@@ -169,7 +184,7 @@ function keepCaretVisible() {
 /** Re-layout after a change. */
 function refresh({ scroll = true } = {}) {
   frame = editor.frame();
-  ensureCanvases(frame.layout.pages);
+  ensureCanvases(frame.layout.pages, frame.page);
   blink = true;
   paint();
   updateToolbar();
@@ -305,6 +320,10 @@ $("size").onchange = act(() => editor.set_size(Math.round(parseFloat($("size").v
 $("color").onchange = act(() => editor.set_color(parseInt($("color").value.slice(1), 16)));
 $("colorReset").onclick = act(() => editor.set_color(-1));
 for (const b of document.querySelectorAll("[data-align]")) b.onclick = act(() => editor.set_align(b.dataset.align));
+$("paper").onchange = act(() => { if ($("paper").value) editor.set_paper($("paper").value); });
+$("spacing").onchange = act(() => editor.set_line_spacing(parseInt($("spacing").value, 10)));
+$("indentMore").onclick = act(() => editor.indent(720));
+$("indentLess").onclick = act(() => editor.indent(-720));
 $("table").onclick = act(() => editor.insert_table(3, 3));
 for (const b of document.querySelectorAll("[data-table]")) b.onclick = act(() => editor.table_op(b.dataset.table));
 $("kind").onchange = act(() => editor.toggle_kind($("kind").value));

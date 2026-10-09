@@ -60,6 +60,12 @@
   <button data-align="center" title="Center (Ctrl+E)" aria-label="Center">≡</button>
   <button data-align="right" title="Align right (Ctrl+R)" aria-label="Align right">⯈</button>
   <button data-align="justify" title="Justify (Ctrl+J)" aria-label="Justify">☰</button>
+  <select id="spacing" title="Line spacing" aria-label="Line spacing">
+    <option value="0">Spacing</option>
+    <option value="240">1.0</option><option value="276">1.15</option><option value="360">1.5</option><option value="480">2.0</option>
+  </select>
+  <button id="indentLess" title="Decrease indent" aria-label="Decrease indent">⇤</button>
+  <button id="indentMore" title="Increase indent" aria-label="Increase indent">⇥</button>
   <span class="sep"></span>
   <button id="bullet" data-kind="bullet" title="Bulleted list" aria-label="Bulleted list">• List</button>
   <button id="numbered" data-kind="numbered" title="Numbered list" aria-label="Numbered list">1. List</button>
@@ -77,6 +83,9 @@
     <button data-table="delete_col" title="Delete column">−Col</button>
     <button data-table="delete_table" title="Delete table">✕ Table</button>
   </span>
+  <select id="paper" title="Paper size" aria-label="Paper size">
+    <option value="">Custom</option><option value="letter">Letter</option><option value="a4">A4</option><option value="legal">Legal</option>
+  </select>
   <span id="status">loading…</span>
   <input id="file" type="file" accept=".docx" hidden>
   <input id="imageFile" type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/bmp" hidden>

@@ -349,6 +349,37 @@ impl Editor {
         self.doc.paragraphs[self.head.para].align
     }
 
+    /// Line spacing for the selected paragraphs in 240ths (240 single, 360
+    /// one-and-a-half, 480 double); `None` restores the default.
+    pub fn set_line_spacing(&mut self, line: Option<u16>) {
+        let (s, e) = self.selection();
+        self.edit(Action::Other, |ed| {
+            for i in s.para..=e.para {
+                ed.doc.paragraphs[i].line_spacing = line;
+            }
+        });
+    }
+
+    /// Indent the selected paragraphs by `delta` twips (negative outdents).
+    pub fn indent(&mut self, delta: i32) {
+        let (s, e) = self.selection();
+        self.edit(Action::Other, |ed| {
+            for i in s.para..=e.para {
+                let p = &mut ed.doc.paragraphs[i];
+                let v = (p.indent_left.unwrap_or(0) as i32 + delta).clamp(0, 12000);
+                p.indent_left = (v > 0).then_some(v as u16);
+            }
+        });
+    }
+
+    pub fn set_page(&mut self, page: Page) {
+        self.edit(Action::Other, |ed| ed.doc.page = page);
+    }
+
+    pub fn current_paragraph(&self) -> &Paragraph {
+        &self.doc.paragraphs[self.head.para]
+    }
+
     // ---- images ----------------------------------------------------------
 
     /// Insert an inline image (display size in px) at the caret.
@@ -986,5 +1017,38 @@ mod tests {
         assert_eq!(e.current_align(), Align::Center);
         e.undo();
         assert_eq!(e.doc().paragraphs.len(), 3);
+    }
+
+    #[test]
+    fn spacing_indent_and_page_edits() {
+        let mut e = ed("a\nb");
+        e.select_all();
+        e.set_line_spacing(Some(360));
+        e.indent(720);
+        e.indent(720);
+        assert!(e
+            .doc()
+            .paragraphs
+            .iter()
+            .all(|p| p.line_spacing == Some(360) && p.indent_left == Some(1440)));
+        e.indent(-5000);
+        assert_eq!(
+            e.doc().paragraphs[0].indent_left,
+            None,
+            "outdent bottoms out at zero"
+        );
+        e.set_cursor(Pos { para: 0, offset: 1 }, false);
+        e.set_line_spacing(Some(480));
+        e.enter();
+        assert_eq!(
+            e.doc().paragraphs[1].line_spacing,
+            Some(480),
+            "Enter keeps paragraph properties"
+        );
+        e.set_page(Page::A4);
+        assert_eq!(e.doc().page, Page::A4);
+        e.undo();
+        assert_eq!(e.doc().page, Page::LETTER);
+        assert_eq!(Page::px(1440), 96.0);
     }
 }
