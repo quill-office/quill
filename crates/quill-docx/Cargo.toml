@@ -1,0 +1,12 @@
+[package]
+name = "quill-docx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+quick-xml = "0.42.0"
+quill-core = { version = "0.1.0", path = "../quill-core" }
+thiserror = "2.0.21"
+zip = { version = "9.0.0", default-features = false, features = ["deflate"] }

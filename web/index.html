@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quill Write</title>
+<style>
+  :root { --bg:#e9ebef; --bar:#fff; --fg:#1f2328; --muted:#6b7280; --line:#d0d7de; --accent:#2563eb; --hover:#f0f3f7; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14161a; --bar:#1e2127; --fg:#e6e8eb; --muted:#9aa1ab; --line:#363b45; --accent:#6ea0ff; --hover:#2a2e37; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px system-ui, sans-serif; }
+  header { position:sticky; top:0; z-index:2; display:flex; flex-wrap:wrap; gap:6px; align-items:center;
+           padding:8px 16px; background:var(--bar); border-bottom:1px solid var(--line); }
+  header strong { margin-right:8px; }
+  .sep { width:1px; align-self:stretch; background:var(--line); margin:0 4px; }
+  button, select { font:inherit; color:inherit; background:none; border:1px solid transparent;
+                   border-radius:6px; padding:4px 9px; cursor:pointer; min-width:30px; }
+  select { border-color:var(--line); background:var(--bar); }
+  button:hover { background:var(--hover); }
+  button:disabled { opacity:.35; cursor:default; background:none; }
+  button[aria-pressed="true"] { background:color-mix(in srgb, var(--accent) 22%, transparent); border-color:var(--accent); }
+  button:focus-visible, select:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  #status { margin-left:auto; color:var(--muted); }
+  #pages { display:flex; flex-direction:column; align-items:center; gap:24px; padding:24px 16px 64px; overflow-x:auto; }
+  canvas { background:#fff; box-shadow:0 1px 4px #0004; cursor:text; flex:none; }
+  #ime { position:fixed; opacity:0; width:1px; height:1em; padding:0; border:0; resize:none; overflow:hidden; }
+</style>
+</head>
+<body>
+<header role="toolbar" aria-label="Formatting">
+  <strong>Quill Write</strong>
+  <button id="open" title="Open .docx">Open</button>
+  <button id="save" title="Save as .docx">Save</button>
+  <span class="sep"></span>
+  <button id="undo" title="Undo (Ctrl+Z)" aria-label="Undo">↶</button>
+  <button id="redo" title="Redo (Ctrl+Shift+Z)" aria-label="Redo">↷</button>
+  <span class="sep"></span>
+  <select id="kind" title="Paragraph style" aria-label="Paragraph style">
+    <option value="normal">Normal</option>
+    <option value="h1">Heading 1</option>
+    <option value="h2">Heading 2</option>
+    <option value="h3">Heading 3</option>
+  </select>
+  <button id="bold" data-attr="bold" title="Bold (Ctrl+B)"><b>B</b></button>
+  <button id="italic" data-attr="italic" title="Italic (Ctrl+I)"><i>I</i></button>
+  <button id="underline" data-attr="underline" title="Underline (Ctrl+U)"><u>U</u></button>
+  <span class="sep"></span>
+  <button id="bullet" data-kind="bullet" title="Bulleted list" aria-label="Bulleted list">• List</button>
+  <button id="numbered" data-kind="numbered" title="Numbered list" aria-label="Numbered list">1. List</button>
+  <span id="status">loading…</span>
+  <input id="file" type="file" accept=".docx" hidden>
+</header>
+<div id="pages"></div>
+<textarea id="ime" aria-label="Document text input" autocapitalize="off" autocomplete="off" spellcheck="false"></textarea>
+<script type="module" src="./main.js"></script>
+</body>
+</html>

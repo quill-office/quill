@@ -1,0 +1,10 @@
+[package]
+name = "quill-layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+quill-core = { version = "0.1.0", path = "../quill-core" }
+serde = { version = "1.0.229", features = ["derive"] }
