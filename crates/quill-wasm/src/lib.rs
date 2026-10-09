@@ -5,7 +5,9 @@
 //! by canvas `measureText`, so layout matches what the browser draws.
 
 use js_sys::Function;
-use quill_core::{Align, Attr, Kind, Page, Pos, Story, PAGES_CHAR, PAGE_CHAR};
+use quill_core::{
+    Align, Attr, FindDir, FindOptions, Kind, Page, Pos, Story, PAGES_CHAR, PAGE_CHAR,
+};
 use quill_layout::{
     base_size, layout, para_size, Caret, Focus, Layout, Measure, PageSetup, Rect, TextStyle,
 };
@@ -68,6 +70,14 @@ struct PageBox {
     bottom: f32,
 }
 
+/// Search state for drawing: where every match is, and which one is selected.
+#[derive(Serialize)]
+struct FindInfo {
+    rects: Vec<Rect>,
+    count: usize,
+    index: Option<usize>,
+}
+
 #[derive(Serialize)]
 struct Frame<'a> {
     layout: &'a Layout,
@@ -76,6 +86,7 @@ struct Frame<'a> {
     state: State,
     /// Page size in CSS px.
     page: PageBox,
+    find: FindInfo,
 }
 
 fn kind_name(k: Kind) -> &'static str {
@@ -109,6 +120,8 @@ pub struct Editor {
     goal_x: Option<f32>,
     /// Page where the header/footer caret is shown (they repeat on every page).
     focus_page: usize,
+    /// The active search, if any.
+    find: Option<(String, FindOptions)>,
 }
 
 #[wasm_bindgen]
@@ -120,6 +133,7 @@ impl Editor {
             measure: None,
             goal_x: None,
             focus_page: 0,
+            find: None,
         }
     }
 
@@ -325,6 +339,61 @@ impl Editor {
     /// Give the document a centred page-number footer.
     pub fn add_page_numbers(&mut self) {
         self.inner.add_page_numbers();
+    }
+
+    // ---- find and replace ------------------------------------------------
+
+    /// Set the search; an empty query clears it.
+    pub fn set_find(&mut self, query: &str, match_case: bool, whole_word: bool) {
+        self.find = (!query.is_empty()).then(|| {
+            (
+                query.to_owned(),
+                FindOptions {
+                    match_case,
+                    whole_word,
+                },
+            )
+        });
+    }
+
+    fn search(&mut self, dir: FindDir) -> bool {
+        self.goal_x = None;
+        match self.find.clone() {
+            Some((q, o)) => self.inner.find(&q, o, dir),
+            None => false,
+        }
+    }
+
+    /// Select the next (or previous) match, wrapping around.
+    pub fn find_next(&mut self, backwards: bool) -> bool {
+        self.search(if backwards {
+            FindDir::Prev
+        } else {
+            FindDir::Next
+        })
+    }
+
+    /// Select the first match at or after the caret (for search-as-you-type).
+    pub fn find_current(&mut self) -> bool {
+        self.search(FindDir::Current)
+    }
+
+    /// Replace the selected match and move to the next; returns whether one was replaced.
+    pub fn replace_current(&mut self, with: &str) -> bool {
+        self.goal_x = None;
+        match self.find.clone() {
+            Some((q, o)) => self.inner.replace_current(&q, o, with),
+            None => false,
+        }
+    }
+
+    /// Replace every match in one undo step; returns how many.
+    pub fn replace_all(&mut self, with: &str) -> usize {
+        self.goal_x = None;
+        match self.find.clone() {
+            Some((q, o)) => self.inner.replace_all(&q, o, with),
+            None => 0,
+        }
     }
 
     /// Insert an inline image at the caret. `width`/`height` are the display
@@ -549,6 +618,21 @@ impl Editor {
                     top: p.top,
                     bottom: p.bottom,
                 }
+            },
+            find: match &self.find {
+                Some((q, o)) => {
+                    let matches = self.inner.doc().find_all(q, *o);
+                    FindInfo {
+                        rects: l.highlight_rects(&matches, &m),
+                        count: matches.len(),
+                        index: matches.iter().position(|&r| r == (s, e)),
+                    }
+                }
+                None => FindInfo {
+                    rects: vec![],
+                    count: 0,
+                    index: None,
+                },
             },
             layout: &l,
         };

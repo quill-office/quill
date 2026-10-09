@@ -962,6 +962,33 @@ impl Layout {
         (self.lines[li].start, self.max_offset(li))
     }
 
+    /// Rectangles for many single-paragraph ranges (e.g. search matches),
+    /// sorted by position. One pass over the lines, however many ranges.
+    pub fn highlight_rects(&self, ranges: &[(Pos, Pos)], m: &dyn Measure) -> Vec<Rect> {
+        let mut out = Vec::new();
+        for (li, l) in self.lines.iter().enumerate() {
+            if !self.in_focus(l) {
+                continue;
+            }
+            let first = ranges.partition_point(|r| r.0.para < l.para);
+            for r in ranges[first..].iter().take_while(|r| r.0.para == l.para) {
+                let lo = r.0.offset.max(l.start);
+                let hi = r.1.offset.min(self.max_offset(li));
+                if lo < hi {
+                    let x1 = self.x_at(li, lo, m);
+                    out.push(Rect {
+                        page: l.page,
+                        x: x1,
+                        y: l.y,
+                        w: self.x_at(li, hi, m) - x1,
+                        h: l.height,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     pub fn selection_rects(&self, start: Pos, end: Pos, m: &dyn Measure) -> Vec<Rect> {
         let mut out = Vec::new();
         if start >= end {
@@ -1898,5 +1925,37 @@ mod tests {
             "last line on the margin"
         );
         assert_eq!(f[0].items[0].x, HF.left + 35.0, "centred: (100 - 30) / 2");
+    }
+
+    #[test]
+    fn highlight_rects_cover_matches_across_lines_and_pages() {
+        let d = doc(&["aaaa bbbb aaaa", "x aaaa", "aaaa", "aaaa", "aaaa", "aaaa"]);
+        let l = lay(&d, SETUP, &m);
+        assert!(l.pages > 1);
+        let at = |para, offset| Pos { para, offset };
+        // Matches in paragraph 0: "aaaa" at 0 (line 1) and at 10 (wrapped line 2); paragraph 5 on a later page.
+        let ranges = [
+            (at(0, 0), at(0, 4)),
+            (at(0, 10), at(0, 14)),
+            (at(1, 2), at(1, 6)),
+            (at(5, 0), at(5, 4)),
+        ];
+        let r = l.highlight_rects(&ranges, &m);
+        assert_eq!(r.len(), 4);
+        assert!(r.iter().all(|x| x.w == 40.0), "four 10px chars each: {r:?}");
+        assert_eq!(
+            (r[0].x, r[1].x),
+            (SETUP.left, SETUP.left),
+            "second match wrapped to the next line"
+        );
+        assert!(r[1].y > r[0].y);
+        assert_eq!(
+            r[3].page,
+            l.lines.iter().find(|x| x.para == 5).unwrap().page
+        );
+        assert!(l.highlight_rects(&[], &m).is_empty());
+        // A match broken by a wrap point is split into one rectangle per line.
+        let broken = [(at(0, 3), at(0, 12))];
+        assert_eq!(l.highlight_rects(&broken, &m).len(), 2);
     }
 }

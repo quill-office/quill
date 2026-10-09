@@ -3,6 +3,7 @@
 //! History is snapshot-based with coalescing of consecutive typing/deleting.
 //! (A merge-friendly operation log arrives with collaboration.)
 
+use crate::find::FindOptions;
 use crate::model::*;
 
 const MAX_HISTORY: usize = 200;
@@ -19,6 +20,15 @@ enum Action {
     Typing,
     Deleting,
     Other,
+}
+
+/// Where a search starts from the current selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FindDir {
+    /// The first match starting at or after the selection (keeps the current match).
+    Current,
+    Next,
+    Prev,
 }
 
 pub struct Editor {
@@ -388,6 +398,92 @@ impl Editor {
 
     pub fn current_paragraph(&self) -> &Paragraph {
         &self.doc.paragraphs[self.head.para]
+    }
+
+    // ---- find and replace --------------------------------------------------
+
+    /// Select a match of `query`, wrapping around the story. Returns whether
+    /// anything matched.
+    pub fn find(&mut self, query: &str, opts: FindOptions, dir: FindDir) -> bool {
+        let matches = self.doc.find_all(query, opts);
+        let (s, e) = self.selection();
+        let pick = match dir {
+            FindDir::Current => matches.iter().find(|m| m.0 >= s),
+            FindDir::Next => matches.iter().find(|m| m.0 >= e),
+            FindDir::Prev => matches.iter().rev().find(|m| m.1 <= s),
+        };
+        let wrapped = match dir {
+            FindDir::Prev => matches.last(),
+            _ => matches.first(),
+        };
+        let Some(&(from, to)) = pick.or(wrapped) else {
+            return false;
+        };
+        self.anchor = from;
+        self.head = to;
+        self.pending = None;
+        self.last = None;
+        true
+    }
+
+    /// `(number of matches, index of the match that is currently selected)`.
+    pub fn find_status(&self, query: &str, opts: FindOptions) -> (usize, Option<usize>) {
+        let matches = self.doc.find_all(query, opts);
+        let sel = self.selection();
+        let index = matches.iter().position(|&m| m == sel);
+        (matches.len(), index)
+    }
+
+    /// Replace `[s, e)` with `text`, keeping the formatting of its first char.
+    fn replace_range(&mut self, s: Pos, e: Pos, text: &str) -> Pos {
+        let fmt = self.doc.format_at(Pos {
+            para: s.para,
+            offset: s.offset + 1,
+        });
+        self.doc.delete_range(s, e);
+        let clean: String = text
+            .chars()
+            .filter(|&c| c != OBJECT_CHAR && !is_field_char(c))
+            .collect();
+        self.doc.insert_text(s, &clean, Some(&fmt))
+    }
+
+    /// Replace the selected match, then select the next one. If the selection
+    /// is not a match, just select the next match. Returns whether a match
+    /// was replaced.
+    pub fn replace_current(&mut self, query: &str, opts: FindOptions, with: &str) -> bool {
+        let sel = self.selection();
+        if !self.doc.find_all(query, opts).contains(&sel) {
+            self.find(query, opts, FindDir::Current);
+            return false;
+        }
+        self.edit(Action::Other, |e| {
+            let end = e.replace_range(sel.0, sel.1, with);
+            e.head = end;
+            e.anchor = end;
+            e.pending = None;
+        });
+        self.find(query, opts, FindDir::Next);
+        true
+    }
+
+    /// Replace every match as one undoable step; returns how many.
+    pub fn replace_all(&mut self, query: &str, opts: FindOptions, with: &str) -> usize {
+        let matches = self.doc.find_all(query, opts);
+        if matches.is_empty() {
+            return 0;
+        }
+        self.edit(Action::Other, |e| {
+            // Back to front, so earlier offsets stay valid.
+            let mut last = matches[0].0;
+            for &(s, end) in matches.iter().rev() {
+                last = e.replace_range(s, end, with);
+            }
+            e.head = e.doc.clamp(last);
+            e.anchor = e.head;
+            e.pending = None;
+        });
+        matches.len()
     }
 
     // ---- headers and footers -----------------------------------------------
@@ -1209,5 +1305,178 @@ mod tests {
         e.add_page_numbers();
         assert_eq!(e.doc().paragraphs[0].text(), PAGE_CHAR.to_string());
         assert!(e.head().offset <= 1);
+    }
+
+    fn opts(case: bool, word: bool) -> FindOptions {
+        FindOptions {
+            match_case: case,
+            whole_word: word,
+        }
+    }
+
+    fn at(para: usize, offset: usize) -> Pos {
+        Pos { para, offset }
+    }
+
+    #[test]
+    fn find_all_handles_case_words_overlap_and_unicode() {
+        let d = Document::from_paragraphs(vec![
+            Paragraph::plain("Cat concat CAT cat_s, cat."),
+            Paragraph::plain("ÉCOLE école aaaa"),
+        ]);
+        let n = |q: &str, o| d.find_all(q, o).len();
+        assert_eq!(n("cat", opts(false, false)), 5);
+        assert_eq!(n("cat", opts(true, false)), 3, "concat, cat_s, cat.");
+        assert_eq!(
+            n("cat", opts(false, true)),
+            3,
+            "Cat, CAT, cat. — not concat or cat_s"
+        );
+        assert_eq!(
+            n("école", opts(false, false)),
+            2,
+            "case folding is Unicode-aware"
+        );
+        assert_eq!(n("école", opts(true, false)), 1);
+        assert_eq!(n("aa", opts(true, false)), 2, "matches do not overlap");
+        assert_eq!(n("", opts(false, false)), 0);
+        assert_eq!(n("zzz", opts(false, false)), 0);
+        assert_eq!(
+            n("cat.", opts(true, true)),
+            1,
+            "punctuation edges skip the word-boundary check"
+        );
+        let m = d.find_all("école", opts(false, false));
+        assert_eq!(m[0], (at(1, 0), at(1, 5)));
+    }
+
+    #[test]
+    fn find_walks_forward_and_backward_with_wraparound() {
+        let mut e = ed("x a x\nb x");
+        let o = opts(true, false);
+        e.set_cursor(Pos::default(), false);
+        assert!(e.find("x", o, FindDir::Current));
+        assert_eq!(
+            e.selection(),
+            (at(0, 0), at(0, 1)),
+            "a match under the caret is kept"
+        );
+        assert!(e.find("x", o, FindDir::Next));
+        assert_eq!(e.selection(), (at(0, 4), at(0, 5)));
+        assert!(e.find("x", o, FindDir::Next));
+        assert_eq!(e.selection(), (at(1, 2), at(1, 3)));
+        assert!(e.find("x", o, FindDir::Next));
+        assert_eq!(e.selection().0, at(0, 0), "wraps to the start");
+        assert!(e.find("x", o, FindDir::Prev));
+        assert_eq!(e.selection().0, at(1, 2), "and back to the end");
+        assert!(e.find("x", o, FindDir::Prev));
+        assert_eq!(e.selection().0, at(0, 4));
+        assert!(!e.find("nope", o, FindDir::Next));
+        assert_eq!(e.find_status("x", o), (3, Some(1)));
+        e.set_cursor(at(0, 2), false);
+        assert_eq!(e.find_status("x", o), (3, None));
+    }
+
+    #[test]
+    fn replace_current_steps_through_matches_and_undoes() {
+        let mut e = ed("one two one two one");
+        let o = opts(true, false);
+        e.set_cursor(Pos::default(), false);
+        assert!(
+            !e.replace_current("one", o, "1"),
+            "first press only selects"
+        );
+        assert_eq!(e.selected_text(), "one");
+        assert!(e.replace_current("one", o, "1"));
+        assert_eq!(e.doc().plain_text(), "1 two one two one");
+        assert_eq!(e.selected_text(), "one", "moved on to the next match");
+        assert!(e.replace_current("one", o, "1"));
+        assert!(e.replace_current("one", o, "1"));
+        assert_eq!(e.doc().plain_text(), "1 two 1 two 1");
+        assert!(!e.has_selection() || e.selected_text() != "one");
+        e.undo();
+        assert_eq!(e.doc().plain_text(), "1 two 1 two one");
+    }
+
+    #[test]
+    fn replacement_containing_the_query_does_not_loop() {
+        let mut e = ed("a a");
+        let o = opts(true, false);
+        e.set_cursor(Pos::default(), false);
+        e.find("a", o, FindDir::Current);
+        assert!(e.replace_current("a", o, "aa"));
+        assert_eq!(e.doc().plain_text(), "aa a");
+        assert_eq!(
+            e.selection(),
+            (at(0, 3), at(0, 4)),
+            "skipped over the text just inserted"
+        );
+        assert_eq!(e.replace_all("a", o, "aa"), 3);
+        assert_eq!(e.doc().plain_text(), "aaaa aa");
+    }
+
+    #[test]
+    fn replace_all_is_one_undo_step_and_keeps_formatting() {
+        let mut e = ed("foo bar foo\nfoo");
+        e.set_cursor(at(0, 0), false);
+        e.set_cursor(at(0, 3), true);
+        e.toggle_attr(Attr::Bold);
+        e.set_cursor(at(1, 0), false);
+        let o = opts(true, false);
+        assert_eq!(e.replace_all("foo", o, "quux"), 3);
+        assert_eq!(e.doc().plain_text(), "quux bar quux\nquux");
+        let runs = &e.doc().paragraphs[0].runs;
+        assert!(
+            runs[0].format.bold && runs[0].text == "quux",
+            "bold first match stays bold: {runs:?}"
+        );
+        assert!(!runs.last().unwrap().format.bold);
+        e.undo();
+        assert_eq!(
+            e.doc().plain_text(),
+            "foo bar foo\nfoo",
+            "one undo restores everything"
+        );
+        assert_eq!(e.replace_all("zzz", o, "y"), 0);
+        assert!(e.can_undo());
+    }
+
+    #[test]
+    fn replace_can_delete_split_and_never_insert_placeholders() {
+        let mut e = ed("a-b-c");
+        let o = opts(true, false);
+        assert_eq!(e.replace_all("-", o, "\n"), 2);
+        assert_eq!(e.doc().plain_text(), "a\nb\nc");
+        assert_eq!(
+            e.replace_all("\n", o, ""),
+            0,
+            "matches never span paragraphs"
+        );
+        let mut e = ed("a-b");
+        assert_eq!(e.replace_all("-", o, ""), 1);
+        assert_eq!(e.doc().plain_text(), "ab");
+        let mut e = ed("a-b");
+        e.replace_all("-", o, &format!("{OBJECT_CHAR}{PAGE_CHAR}x"));
+        assert_eq!(e.doc().plain_text(), "axb");
+    }
+
+    #[test]
+    fn find_works_in_table_cells_and_the_active_story() {
+        let mut e = ed("top");
+        e.insert_table(1, 2);
+        e.insert_text("top cell");
+        let o = opts(false, true);
+        assert_eq!(e.doc().find_all("TOP", o).len(), 2);
+        assert_eq!(e.replace_all("top", o, "head"), 2);
+        assert!(e
+            .doc()
+            .paragraphs
+            .iter()
+            .any(|p| p.cell.is_some() && p.text() == "head cell"));
+        // Searches look at the story being edited.
+        e.enter_story(Story::Footer);
+        assert_eq!(e.doc().find_all("head", o).len(), 0);
+        e.insert_text("head");
+        assert_eq!(e.doc().find_all("head", o).len(), 1);
     }
 }

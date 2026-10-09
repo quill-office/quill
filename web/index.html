@@ -22,6 +22,11 @@
   button:disabled { opacity:.35; cursor:default; background:none; }
   button[aria-pressed="true"] { background:color-mix(in srgb, var(--accent) 22%, transparent); border-color:var(--accent); }
   button:focus-visible, select:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  #findbar { flex-basis:100%; display:flex; flex-wrap:wrap; gap:6px; align-items:center; padding-top:6px; border-top:1px solid var(--line); }
+  #findbar[hidden] { display:none; }
+  #findbar input[type="text"] { font:inherit; color:inherit; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:4px 8px; width:170px; }
+  #findbar label { display:flex; gap:4px; align-items:center; color:var(--muted); }
+  #findCount { color:var(--muted); min-width:84px; }
   .color input { width:30px; height:26px; padding:0; border:1px solid var(--line); border-radius:6px; background:none; cursor:pointer; }
   #status { margin-left:auto; color:var(--muted); }
   #pages { display:flex; flex-direction:column; align-items:center; gap:24px; padding:24px 16px 64px; overflow-x:auto; }
@@ -33,6 +38,7 @@
 <header role="toolbar" aria-label="Formatting">
   <strong>Quill Write</strong>
   <button id="open" title="Open .docx">Open</button>
+  <button id="find" title="Find and replace (Ctrl+F)">🔍 Find</button>
   <button id="save" title="Save as .docx">Save</button>
   <span class="sep"></span>
   <button id="undo" title="Undo (Ctrl+Z)" aria-label="Undo">↶</button>
@@ -95,6 +101,18 @@
     <option value="">Custom</option><option value="letter">Letter</option><option value="a4">A4</option><option value="legal">Legal</option>
   </select>
   <span id="status">loading…</span>
+  <div id="findbar" hidden role="search">
+    <input id="findQ" type="text" placeholder="Find" aria-label="Find" autocomplete="off" spellcheck="false">
+    <input id="findR" type="text" placeholder="Replace with" aria-label="Replace with" autocomplete="off" spellcheck="false">
+    <label><input id="findCase" type="checkbox"> Match case</label>
+    <label><input id="findWord" type="checkbox"> Whole word</label>
+    <span id="findCount" aria-live="polite"></span>
+    <button id="findPrev" title="Previous match (Shift+Enter)" aria-label="Previous match">▲</button>
+    <button id="findNext" title="Next match (Enter)" aria-label="Next match">▼</button>
+    <button id="replaceOne" title="Replace this match and go to the next">Replace</button>
+    <button id="replaceAll" title="Replace every match">Replace all</button>
+    <button id="findClose" title="Close (Esc)" aria-label="Close find">✕</button>
+  </div>
   <input id="file" type="file" accept=".docx" hidden>
   <input id="imageFile" type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/bmp" hidden>
 </header>

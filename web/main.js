@@ -7,6 +7,7 @@ const SERIF = /^(times|cambria|georgia|garamond|palatino|book antiqua|century|ba
 const generic = (name) => (MONO.test(name) ? "monospace" : SERIF.test(name) ? "serif" : "sans-serif");
 const TEXT_COLOR = "#1f2328";
 const SELECTION_COLOR = "rgba(37, 99, 235, 0.3)";
+const FIND_COLOR = "rgba(250, 204, 21, 0.55)";
 const CARET_COLOR = "#2563eb";
 
 const $ = (id) => document.getElementById(id);
@@ -35,6 +36,7 @@ Quill is an open-source office suite written in Rust and compiled to WebAssembly
 - Tables: use the Table button, then Tab to move between cells
 - Images: use the Image button, or paste or drop one onto the page
 - Headers and footers: double-click the top or bottom margin, or use Page no. for page numbers
+- Find and replace: Ctrl+F to search, Ctrl+H to replace
 - Pages, wrapping, and opening or saving .docx files
 ## Try it
 1. Press Ctrl+Z after typing to undo a burst of typing at once
@@ -114,6 +116,8 @@ function paint() {
     ctx.strokeStyle = "#9aa0a6";
     ctx.lineWidth = 1;
     for (const c of frame.layout.cells) if (c.page === p) ctx.strokeRect(c.x + 0.5, c.y + 0.5, c.w, c.h);
+    ctx.fillStyle = FIND_COLOR;
+    for (const r of frame.find.rects) if (r.page === p) ctx.fillRect(r.x, r.y, r.w, r.h);
     ctx.fillStyle = TEXT_COLOR;
     ctx.textBaseline = "alphabetic";
     for (const line of frame.layout.lines) {
@@ -154,6 +158,12 @@ function paint() {
   });
 }
 
+function updateFindCount() {
+  if ($("findbar").hidden) return;
+  const { count, index } = frame.find;
+  $("findCount").textContent = !$("findQ").value ? "" : count === 0 ? "No matches" : index == null ? `${count} found` : `${index + 1} of ${count}`;
+}
+
 function updateToolbar() {
   const s = frame.state;
   for (const b of document.querySelectorAll("[data-attr]")) b.setAttribute("aria-pressed", String(s[b.dataset.attr]));
@@ -175,6 +185,7 @@ function updateToolbar() {
   const sel = $("kind");
   sel.value = ["normal", "h1", "h2", "h3"].includes(s.kind) ? s.kind : "normal";
   const inHf = s.story !== "body";
+  updateFindCount();
   $("hfTools").hidden = !inHf;
   $("editHeader").setAttribute("aria-pressed", String(s.story === "header"));
   $("editFooter").setAttribute("aria-pressed", String(s.story === "footer"));
@@ -399,6 +410,62 @@ pagesEl.addEventListener("drop", async (e) => {
   const p = locate(e.clientX, e.clientY);
   editor.click(p.page, p.x, p.y, false, 1);
   await insertImageFile(f);
+});
+
+// ---- find and replace -----------------------------------------------------
+
+const findbar = $("findbar");
+function applySearch({ select = true } = {}) {
+  editor.set_find($("findQ").value, $("findCase").checked, $("findWord").checked);
+  if (select && $("findQ").value) editor.find_current();
+  refresh();
+}
+function openFind(focusReplace = false) {
+  const sel = editor.selected_text();
+  if (sel && !sel.includes("\n")) $("findQ").value = sel;
+  findbar.hidden = false;
+  (focusReplace ? $("findR") : $("findQ")).focus();
+  (focusReplace ? $("findR") : $("findQ")).select();
+  applySearch();
+}
+function closeFind() {
+  findbar.hidden = true;
+  editor.set_find("", false, false);
+  ime.focus();
+  refresh();
+}
+function step(backwards) {
+  applySearch({ select: false });
+  editor.find_next(backwards);
+  refresh();
+}
+$("find").onclick = () => openFind();
+$("findClose").onclick = closeFind;
+$("findNext").onclick = () => step(false);
+$("findPrev").onclick = () => step(true);
+$("replaceOne").onclick = () => {
+  applySearch({ select: false });
+  editor.replace_current($("findR").value);
+  refresh();
+};
+$("replaceAll").onclick = () => {
+  applySearch({ select: false });
+  const n = editor.replace_all($("findR").value);
+  refresh();
+  $("findCount").textContent = n ? `Replaced ${n}` : "No matches";
+};
+for (const el of [$("findCase"), $("findWord")]) el.onchange = () => applySearch();
+$("findQ").addEventListener("input", () => applySearch());
+for (const el of [$("findQ"), $("findR")]) {
+  el.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); closeFind(); }
+    else if (e.key === "Enter") { e.preventDefault(); el === $("findR") ? $("replaceOne").click() : step(e.shiftKey); }
+  });
+}
+document.addEventListener("keydown", (e) => {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === "f" || k === "h") { e.preventDefault(); openFind(k === "h"); }
 });
 
 const file = $("file");

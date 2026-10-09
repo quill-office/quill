@@ -23,7 +23,7 @@ python3 -m http.server -d web 8080   # open http://localhost:8080
 cargo test --workspace
 ```
 
-## Status: phase 7
+## Status: phase 8
 
 Works: typing, selection (mouse drag, Shift+arrows, double/triple-click, Select All), cut/copy/paste,
 undo/redo (typing bursts coalesce), bold/italic/underline (also for upcoming typing), Heading 1–3,
@@ -33,12 +33,13 @@ grow their row, rows that move across pages), and `.docx` open/save for all of t
 line breaks included), inline images (insert, paste, drag-and-drop, resize, saved into `.docx`),
 font family, size and colour per character, paragraph alignment (left, centre, right, justify), and mixed
 sizes on one line; paragraph spacing, line spacing and indents; paper sizes (Letter, A4, Legal) and page margins; headers and footers with page-number and page-count
-fields (double-click the top or bottom margin, or use the Page no. button), saved to and read from `.docx`.
+fields (double-click the top or bottom margin, or use the Page no. button), saved to and read from `.docx`; find and replace (case and whole-word options, live highlighting,
+replace all as one undo step).
 
 `.docx` import resolves Word's styling: document defaults, theme fonts, paragraph and character styles with
 `basedOn` inheritance, table-style paragraph properties, and the section's page size and margins.
 
-Not yet: floating/wrapped images, drag-resize handles, SVG/EMF images, merged table cells, column resizing, nested tables, highlight/strikethrough/super- and subscript, nested lists, conditional table formatting (banded rows etc.),
+Not yet: regular-expression and formatting search, searching all stories at once, floating/wrapped images, drag-resize handles, SVG/EMF images, merged table cells, column resizing, nested tables, highlight/strikethrough/super- and subscript, nested lists, conditional table formatting (banded rows etc.),
 multiple sections, different first-page and odd/even headers, pictures and tables in headers/footers,
 other fields (date, title, …), exact/at-least line spacing, right indents, headers/footers, page-break control
 (widows/orphans), word-wise caret movement (Alt/Ctrl+arrows), find/replace, rich clipboard (HTML),
