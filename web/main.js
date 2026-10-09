@@ -12,9 +12,11 @@ const ime = $("ime");
 const statusEl = $("status");
 const mctx = document.createElement("canvas").getContext("2d");
 
-const fontFor = (bold, italic, size) => `${italic ? "italic " : ""}${bold ? "bold " : ""}${size}px ${FONT_FAMILY}`;
-function measure(text, bold, italic, size) {
-  mctx.font = fontFor(bold, italic, size);
+const fontFor = (bold, italic, size, font) =>
+  `${italic ? "italic " : ""}${bold ? "bold " : ""}${size}px ${font ? `"${font}", ` : ""}${FONT_FAMILY}`;
+const cssColor = (rgb) => (rgb == null ? TEXT_COLOR : `#${rgb.toString(16).padStart(6, "0")}`);
+function measure(text, bold, italic, size, font) {
+  mctx.font = fontFor(bold, italic, size, font);
   return mctx.measureText(text).width;
 }
 
@@ -27,7 +29,7 @@ Quill is an open-source office suite written in Rust and compiled to WebAssembly
 ## What works today
 - Selection with mouse, Shift+arrows, double-click for a word, triple-click for a paragraph
 - Undo and redo, cut, copy and paste
-- Bold, italic and underline; headings; bulleted and numbered lists
+- Bold, italic and underline; fonts, sizes and colours; alignment; headings; lists
 - Tables: use the Table button, then Tab to move between cells
 - Images: use the Image button, or paste or drop one onto the page
 - Pages, wrapping, and opening or saving .docx files
@@ -93,17 +95,20 @@ function paint() {
       if (line.marker && line.items[0]) {
         const it = line.items[0];
         ctx.font = fontFor(it.bold, false, it.size);
+        ctx.fillStyle = TEXT_COLOR;
         ctx.fillText(line.marker.text, line.marker.x, by);
       } else if (line.marker) {
-        ctx.font = fontFor(false, false, 17);
+        ctx.font = fontFor(false, false, 16);
+        ctx.fillStyle = TEXT_COLOR;
         ctx.fillText(line.marker.text, line.marker.x, by);
       }
       for (const it of line.items) {
         if (it.image) { drawImage(ctx, it, by); continue; }
-        ctx.font = fontFor(it.bold, it.italic, it.size);
+        ctx.font = fontFor(it.bold, it.italic, it.size, it.font);
+        ctx.fillStyle = cssColor(it.color);
         ctx.fillText(it.text, it.x, by);
         if (it.underline) {
-          const w = measure(it.text.trimEnd(), it.bold, it.italic, it.size);
+          const w = measure(it.text.trimEnd(), it.bold, it.italic, it.size, it.font);
           ctx.fillRect(it.x, by + 2, w, 1);
         }
       }
@@ -122,6 +127,17 @@ function updateToolbar() {
   const s = frame.state;
   for (const b of document.querySelectorAll("[data-attr]")) b.setAttribute("aria-pressed", String(s[b.dataset.attr]));
   for (const b of document.querySelectorAll("[data-kind]")) b.setAttribute("aria-pressed", String(s.kind === b.dataset.kind));
+  $("font").value = s.font ?? "";
+  if (s.font && $("font").value !== s.font) $("font").add(new Option(s.font, s.font, false, true));
+  const pt = String(s.size / 2);
+  if (![...$("size").options].some((o) => o.value === pt)) {
+    const opt = new Option(pt, pt);
+    const next = [...$("size").options].find((o) => parseFloat(o.value) > s.size / 2);
+    $("size").add(opt, next ?? null);
+  }
+  $("size").value = pt;
+  $("color").value = cssColor(s.color).slice(0, 7);
+  for (const b of document.querySelectorAll("[data-align]")) b.setAttribute("aria-pressed", String(s.align === b.dataset.align));
   const sel = $("kind");
   sel.value = ["normal", "h1", "h2", "h3"].includes(s.kind) ? s.kind : "normal";
   $("imageTools").hidden = !s.image_selected;
@@ -225,6 +241,10 @@ ime.addEventListener("keydown", (e) => {
       case "b": editor.toggle_attr("bold"); break;
       case "i": editor.toggle_attr("italic"); break;
       case "u": editor.toggle_attr("underline"); break;
+      case "l": editor.set_align("left"); break;
+      case "e": editor.set_align("center"); break;
+      case "r": editor.set_align("right"); break;
+      case "j": editor.set_align("justify"); break;
       default: return; // let copy/cut/paste events through
     }
   } else {
@@ -279,6 +299,12 @@ $("undo").onclick = act(() => editor.undo());
 $("redo").onclick = act(() => editor.redo());
 for (const b of document.querySelectorAll("[data-attr]")) b.onclick = act(() => editor.toggle_attr(b.dataset.attr));
 for (const b of document.querySelectorAll("[data-kind]")) b.onclick = act(() => editor.toggle_kind(b.dataset.kind));
+for (const pt of [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72]) $("size").add(new Option(String(pt), String(pt)));
+$("font").onchange = act(() => editor.set_font($("font").value));
+$("size").onchange = act(() => editor.set_size(Math.round(parseFloat($("size").value) * 2)));
+$("color").onchange = act(() => editor.set_color(parseInt($("color").value.slice(1), 16)));
+$("colorReset").onclick = act(() => editor.set_color(-1));
+for (const b of document.querySelectorAll("[data-align]")) b.onclick = act(() => editor.set_align(b.dataset.align));
 $("table").onclick = act(() => editor.insert_table(3, 3));
 for (const b of document.querySelectorAll("[data-table]")) b.onclick = act(() => editor.table_op(b.dataset.table));
 $("kind").onchange = act(() => editor.toggle_kind($("kind").value));

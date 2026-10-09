@@ -22,6 +22,7 @@
   button:disabled { opacity:.35; cursor:default; background:none; }
   button[aria-pressed="true"] { background:color-mix(in srgb, var(--accent) 22%, transparent); border-color:var(--accent); }
   button:focus-visible, select:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  .color input { width:30px; height:26px; padding:0; border:1px solid var(--line); border-radius:6px; background:none; cursor:pointer; }
   #status { margin-left:auto; color:var(--muted); }
   #pages { display:flex; flex-direction:column; align-items:center; gap:24px; padding:24px 16px 64px; overflow-x:auto; }
   canvas { background:#fff; box-shadow:0 1px 4px #0004; cursor:text; flex:none; }
@@ -43,9 +44,22 @@
     <option value="h2">Heading 2</option>
     <option value="h3">Heading 3</option>
   </select>
+  <select id="font" title="Font" aria-label="Font">
+    <option value="">Default</option>
+    <option>Arial</option><option>Verdana</option><option>Tahoma</option><option>Trebuchet MS</option>
+    <option>Times New Roman</option><option>Georgia</option><option>Courier New</option>
+  </select>
+  <select id="size" title="Font size (pt)" aria-label="Font size"></select>
   <button id="bold" data-attr="bold" title="Bold (Ctrl+B)"><b>B</b></button>
   <button id="italic" data-attr="italic" title="Italic (Ctrl+I)"><i>I</i></button>
   <button id="underline" data-attr="underline" title="Underline (Ctrl+U)"><u>U</u></button>
+  <label class="color" title="Text colour"><input id="color" type="color" value="#1f2328" aria-label="Text colour"></label>
+  <button id="colorReset" title="Default text colour" aria-label="Default text colour">⌫</button>
+  <span class="sep"></span>
+  <button data-align="left" title="Align left (Ctrl+L)" aria-label="Align left">⯇</button>
+  <button data-align="center" title="Center (Ctrl+E)" aria-label="Center">≡</button>
+  <button data-align="right" title="Align right (Ctrl+R)" aria-label="Align right">⯈</button>
+  <button data-align="justify" title="Justify (Ctrl+J)" aria-label="Justify">☰</button>
   <span class="sep"></span>
   <button id="bullet" data-kind="bullet" title="Bulleted list" aria-label="Bulleted list">• List</button>
   <button id="numbered" data-kind="numbered" title="Numbered list" aria-label="Numbered list">1. List</button>

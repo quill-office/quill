@@ -9,7 +9,7 @@ use std::io::{Cursor, Read, Write};
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
-use quill_core::{Cell, Document, Format, Image, Kind, Paragraph, Run, OBJECT_CHAR};
+use quill_core::{Align, Cell, Document, Format, Image, Kind, Paragraph, Run, OBJECT_CHAR};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocxError {
@@ -190,6 +190,7 @@ fn parse_document_xml(
     let mut style_kind: Option<Kind> = None;
     let mut num_kind: Option<Kind> = None;
     let mut fmt = Format::default();
+    let mut align = Align::Left;
     let mut in_text = false;
     // Table state. Only the outermost table is modelled; paragraphs of nested
     // tables are folded into the enclosing cell.
@@ -209,11 +210,41 @@ fn parse_document_xml(
                 cur = Some(Paragraph::default());
                 style_kind = None;
                 num_kind = None;
+                align = Align::Left;
             }
             Event::Empty(e) if e.local_name().as_ref() == "p" => paras.push(Paragraph {
                 cell,
                 ..Default::default()
             }),
+            Event::Start(e) | Event::Empty(e)
+                if matches!(e.local_name().as_ref(), "rFonts" | "color" | "sz" | "jc") =>
+            {
+                match e.local_name().as_ref() {
+                    "rFonts" => {
+                        fmt.font = attr(&e, "ascii")
+                            .or_else(|| attr(&e, "hAnsi"))
+                            .filter(|n| !n.is_empty())
+                            .map(Into::into);
+                    }
+                    "color" => {
+                        fmt.color = attr(&e, "val")
+                            .filter(|v| v.len() == 6)
+                            .and_then(|v| u32::from_str_radix(&v, 16).ok());
+                    }
+                    "sz" => fmt.size = attr(&e, "val").and_then(|v| v.parse().ok()),
+                    // `jc` also appears in table properties; only paragraphs count.
+                    _ => {
+                        if cur.is_some() {
+                            align = match attr(&e, "val").as_deref() {
+                                Some("center") => Align::Center,
+                                Some("right" | "end") => Align::Right,
+                                Some("both" | "distribute") => Align::Justify,
+                                _ => Align::Left,
+                            };
+                        }
+                    }
+                }
+            }
             Event::Start(e) => match e.local_name().as_ref() {
                 "drawing" => {
                     in_drawing = true;
@@ -309,6 +340,7 @@ fn parse_document_xml(
                 "p" => {
                     if let Some(mut p) = cur.take() {
                         p.cell = cell;
+                        p.align = align;
                         // A list numbering wins over a plain style.
                         p.kind = num_kind.or(style_kind).unwrap_or(Kind::Normal);
                         paras.push(p);
@@ -343,6 +375,10 @@ fn push(cur: &mut Option<Paragraph>, text: &str, fmt: &Format) {
     }
 }
 
+fn esc_attr(s: &str) -> String {
+    esc(s).replace('"', "&quot;")
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -350,12 +386,25 @@ fn esc(s: &str) -> String {
 }
 
 fn run_xml(text: &str, f: &Format) -> String {
+    // Child order follows the WordprocessingML schema (rFonts, b, i, color, sz, u).
     let mut props = String::new();
+    if let Some(font) = &f.font {
+        let n = esc_attr(font);
+        props.push_str(&format!(
+            "<w:rFonts w:ascii=\"{n}\" w:hAnsi=\"{n}\" w:cs=\"{n}\"/>"
+        ));
+    }
     if f.bold {
         props.push_str("<w:b/>");
     }
     if f.italic {
         props.push_str("<w:i/>");
+    }
+    if let Some(c) = f.color {
+        props.push_str(&format!("<w:color w:val=\"{c:06X}\"/>"));
+    }
+    if let Some(sz) = f.size {
+        props.push_str(&format!("<w:sz w:val=\"{sz}\"/><w:szCs w:val=\"{sz}\"/>"));
     }
     if f.underline {
         props.push_str("<w:u w:val=\"single\"/>");
@@ -451,16 +500,27 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
             prev_numbered = false;
             prev_cell = p.cell;
         }
-        let ppr = match p.kind {
+        let style_and_num = match p.kind {
             Kind::Normal => String::new(),
-            Kind::Heading(n) => format!("<w:pPr><w:pStyle w:val=\"Heading{n}\"/></w:pPr>"),
-            Kind::Bullet => "<w:pPr><w:pStyle w:val=\"ListParagraph\"/><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr></w:pPr>".to_string(),
+            Kind::Heading(n) => format!("<w:pStyle w:val=\"Heading{n}\"/>"),
+            Kind::Bullet => "<w:pStyle w:val=\"ListParagraph\"/><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr>".to_string(),
             Kind::Numbered => {
                 if !prev_numbered {
                     numbered_lists += 1;
                 }
-                format!("<w:pPr><w:pStyle w:val=\"ListParagraph\"/><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"{}\"/></w:numPr></w:pPr>", numbered_lists + 1)
+                format!("<w:pStyle w:val=\"ListParagraph\"/><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"{}\"/></w:numPr>", numbered_lists + 1)
             }
+        };
+        let jc = match p.align {
+            Align::Left => "",
+            Align::Center => "<w:jc w:val=\"center\"/>",
+            Align::Right => "<w:jc w:val=\"right\"/>",
+            Align::Justify => "<w:jc w:val=\"both\"/>",
+        };
+        let ppr = if style_and_num.is_empty() && jc.is_empty() {
+            String::new()
+        } else {
+            format!("<w:pPr>{style_and_num}{jc}</w:pPr>")
         };
         prev_numbered = p.kind == Kind::Numbered;
         body.push_str("<w:p>");
@@ -520,9 +580,9 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
         "{XML_DECL}<w:styles xmlns:w=\"{NS_W}\">\
 <w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:qFormat/></w:style>{}{}{}\
 <w:style w:type=\"paragraph\" w:styleId=\"ListParagraph\"><w:name w:val=\"List Paragraph\"/><w:basedOn w:val=\"Normal\"/><w:qFormat/><w:pPr><w:ind w:left=\"720\"/></w:pPr></w:style></w:styles>",
-        heading(1, 56),
-        heading(2, 44),
-        heading(3, 38)
+        heading(1, 40),
+        heading(2, 32),
+        heading(3, 28)
     );
 
     let content_types = format!(
@@ -806,5 +866,60 @@ mod tests {
         assert_eq!(d.images.len(), 1, "unresolvable relationship is skipped");
         assert_eq!((d.images[0].width, d.images[0].height), (100, 50));
         assert_eq!(d.paragraphs[0].len(), 2);
+    }
+
+    #[test]
+    fn character_and_paragraph_formatting_round_trip() {
+        let mut d = Document::from_paragraphs(vec![
+            Paragraph::plain("Big red Courier & <more>"),
+            Paragraph::plain("centered"),
+            Paragraph::plain("right").with_kind(Kind::Bullet),
+            Paragraph::plain("justified"),
+            Paragraph::plain("plain"),
+        ]);
+        d.set_format(0, 0, 3, |f| f.size = Some(48));
+        d.set_format(0, 4, 7, |f| f.color = Some(0xC0392B));
+        d.set_format(0, 8, 15, |f| {
+            f.font = Some("Courier New".into());
+            f.size = Some(21); // 10.5pt
+            f.bold = true;
+        });
+        d.paragraphs[1].align = Align::Center;
+        d.paragraphs[2].align = Align::Right;
+        d.paragraphs[3].align = Align::Justify;
+        let bytes = write(&d).unwrap();
+        assert_eq!(read(&bytes).unwrap(), d);
+
+        let mut z = zip::ZipArchive::new(Cursor::new(&bytes[..])).unwrap();
+        let xml = read_part(&mut z, "word/document.xml").unwrap().unwrap();
+        assert!(xml.contains("<w:sz w:val=\"48\"/>") && xml.contains("<w:sz w:val=\"21\"/>"));
+        assert!(xml.contains("<w:color w:val=\"C0392B\"/>"));
+        assert!(xml.contains("w:ascii=\"Courier New\""));
+        assert!(xml.contains("<w:jc w:val=\"both\"/>"));
+        // Schema order: pStyle, numPr, then jc.
+        let ppr = xml.split("<w:pPr>").find(|p| p.contains("numPr")).unwrap();
+        assert!(ppr.find("numPr").unwrap() < ppr.find("<w:jc").unwrap());
+    }
+
+    #[test]
+    fn word_style_values_are_understood() {
+        let xml = r#"<w:document xmlns:w="w"><w:body>
+          <w:p><w:pPr><w:jc w:val="end"/><w:rPr><w:sz w:val="40"/></w:rPr></w:pPr>
+            <w:r><w:rPr><w:rFonts w:hAnsi="Calibri"/><w:color w:val="auto"/><w:sz w:val="22"/></w:rPr><w:t>x</w:t></w:r></w:p>
+          <w:tbl><w:tblPr><w:jc w:val="center"/></w:tblPr><w:tr><w:tc><w:p><w:r><w:t>c</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        </w:body></w:document>"#;
+        let d = parse_document_xml(xml, &HashMap::new(), &Media::new()).unwrap();
+        let p = &d.paragraphs[0];
+        assert_eq!(p.align, Align::Right);
+        let f = &p.runs[0].format;
+        assert_eq!(
+            (f.size, f.font.as_deref(), f.color),
+            (Some(22), Some("Calibri"), None)
+        );
+        assert_eq!(
+            d.paragraphs[1].align,
+            Align::Left,
+            "table jc must not leak into the cell paragraph"
+        );
     }
 }

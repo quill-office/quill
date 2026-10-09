@@ -7,4 +7,4 @@ repository.workspace = true
 
 [dependencies]
 quill-core = { version = "0.1.0", path = "../quill-core" }
-serde = { version = "1.0.229", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }

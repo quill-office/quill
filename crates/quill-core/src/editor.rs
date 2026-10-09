@@ -305,6 +305,50 @@ impl Editor {
         });
     }
 
+    // ---- character and paragraph formatting ------------------------------
+
+    /// Apply a format change to the selection, or to upcoming typing when
+    /// nothing is selected.
+    fn apply_format(&mut self, f: impl Fn(&mut Format)) {
+        if self.has_selection() {
+            let (s, e) = self.selection();
+            self.edit(Action::Other, |ed| ed.doc.set_format_range(s, e, f));
+        } else {
+            let mut fmt = self.current_format();
+            f(&mut fmt);
+            self.pending = Some(fmt);
+        }
+    }
+
+    /// Font size in half-points; `None` returns to the paragraph default.
+    pub fn set_size(&mut self, half_points: Option<u16>) {
+        self.apply_format(|f| f.size = half_points.map(|v| v.clamp(2, 1000)));
+    }
+
+    pub fn set_font(&mut self, font: Option<&str>) {
+        let font: Option<std::sync::Arc<str>> = font.filter(|n| !n.is_empty()).map(Into::into);
+        self.apply_format(|f| f.font = font.clone());
+    }
+
+    /// Text colour as `0xRRGGBB`; `None` returns to the default.
+    pub fn set_color(&mut self, color: Option<u32>) {
+        self.apply_format(|f| f.color = color.map(|c| c & 0xFF_FFFF));
+    }
+
+    /// Align every selected paragraph.
+    pub fn set_align(&mut self, align: Align) {
+        let (s, e) = self.selection();
+        self.edit(Action::Other, |ed| {
+            for i in s.para..=e.para {
+                ed.doc.paragraphs[i].align = align;
+            }
+        });
+    }
+
+    pub fn current_align(&self) -> Align {
+        self.doc.paragraphs[self.head.para].align
+    }
+
     // ---- images ----------------------------------------------------------
 
     /// Insert an inline image (display size in px) at the caret.
@@ -882,5 +926,65 @@ mod tests {
         e.undo();
         e.redo();
         assert!(std::sync::Arc::ptr_eq(&first, &e.doc().images[0].data));
+    }
+
+    #[test]
+    fn size_font_color_apply_to_selection_and_typing() {
+        let mut e = ed("abcd");
+        e.set_cursor(Pos { para: 0, offset: 1 }, false);
+        e.set_cursor(Pos { para: 0, offset: 3 }, true);
+        e.set_size(Some(28));
+        e.set_font(Some("Arial"));
+        e.set_color(Some(0x112233));
+        let runs = &e.doc().paragraphs[0].runs;
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].format.size, Some(28));
+        assert_eq!(runs[1].format.font.as_deref(), Some("Arial"));
+        assert_eq!(runs[1].format.color, Some(0x112233));
+        assert_eq!(runs[0].format.size, None);
+        // Caret only: applies to what is typed next, then sticks to that text.
+        e.set_cursor(Pos { para: 0, offset: 4 }, false);
+        e.set_size(Some(40));
+        e.insert_text("Z");
+        e.insert_text("Y");
+        let last = e.doc().paragraphs[0].runs.last().unwrap();
+        assert_eq!((last.text.as_str(), last.format.size), ("ZY", Some(40)));
+        // Clearing returns to defaults.
+        e.select_all();
+        e.set_size(None);
+        e.set_font(None);
+        e.set_color(None);
+        assert_eq!(e.doc().paragraphs[0].runs.len(), 1);
+        for _ in 0..3 {
+            e.undo(); // one step per property
+        }
+        assert_eq!(e.doc().paragraphs[0].runs.len(), 4);
+    }
+
+    #[test]
+    fn typing_inherits_size_from_previous_text() {
+        let mut e = ed("ab");
+        e.select_all();
+        e.set_size(Some(30));
+        e.set_cursor(Pos { para: 0, offset: 2 }, false);
+        e.insert_text("c");
+        assert_eq!(e.doc().paragraphs[0].runs.len(), 1);
+        assert_eq!(e.doc().paragraphs[0].runs[0].format.size, Some(30));
+    }
+
+    #[test]
+    fn alignment_applies_to_selected_paragraphs_and_survives_enter() {
+        let mut e = ed("a\nb\nc");
+        e.set_cursor(Pos { para: 0, offset: 0 }, false);
+        e.set_cursor(Pos { para: 1, offset: 1 }, true);
+        e.set_align(Align::Center);
+        let a: Vec<_> = e.doc().paragraphs.iter().map(|p| p.align).collect();
+        assert_eq!(a, [Align::Center, Align::Center, Align::Left]);
+        e.set_cursor(Pos { para: 1, offset: 1 }, false);
+        e.enter();
+        assert_eq!(e.doc().paragraphs[2].align, Align::Center);
+        assert_eq!(e.current_align(), Align::Center);
+        e.undo();
+        assert_eq!(e.doc().paragraphs.len(), 3);
     }
 }

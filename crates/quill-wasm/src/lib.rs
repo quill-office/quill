@@ -5,8 +5,8 @@
 //! by canvas `measureText`, so layout matches what the browser draws.
 
 use js_sys::Function;
-use quill_core::{Attr, Kind, Pos};
-use quill_layout::{layout, Caret, Layout, Measure, PageSetup, Rect, TextStyle};
+use quill_core::{Align, Attr, Kind, Pos};
+use quill_layout::{layout, para_size, Caret, Layout, Measure, PageSetup, Rect, TextStyle};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -14,14 +14,19 @@ struct JsMeasure<'a>(&'a Function);
 
 impl Measure for JsMeasure<'_> {
     fn width(&self, text: &str, s: &TextStyle) -> f32 {
+        let font = s
+            .font
+            .as_deref()
+            .map_or(JsValue::UNDEFINED, JsValue::from_str);
+        let args = js_sys::Array::of5(
+            &text.into(),
+            &s.bold.into(),
+            &s.italic.into(),
+            &s.size.into(),
+            &font,
+        );
         self.0
-            .call4(
-                &JsValue::NULL,
-                &text.into(),
-                &s.bold.into(),
-                &s.italic.into(),
-                &s.size.into(),
-            )
+            .apply(&JsValue::NULL, &args)
             .ok()
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0) as f32
@@ -39,6 +44,11 @@ struct State {
     has_selection: bool,
     in_table: bool,
     image_selected: bool,
+    /// Effective font size at the caret, in half-points.
+    size: u16,
+    font: Option<String>,
+    color: Option<u32>,
+    align: &'static str,
 }
 
 #[derive(Serialize)]
@@ -218,6 +228,34 @@ impl Editor {
         Ok(())
     }
 
+    /// Font size in half-points (24 = 12 pt); 0 restores the paragraph default.
+    pub fn set_size(&mut self, half_points: u16) {
+        self.inner
+            .set_size((half_points > 0).then_some(half_points));
+    }
+
+    /// Font family name; "" restores the default.
+    pub fn set_font(&mut self, name: &str) {
+        self.inner.set_font(Some(name));
+    }
+
+    /// Text colour as 0xRRGGBB; a negative value restores the default.
+    pub fn set_color(&mut self, rgb: i32) {
+        self.inner.set_color((rgb >= 0).then_some(rgb as u32));
+    }
+
+    /// `align` is "left", "center", "right" or "justify".
+    pub fn set_align(&mut self, align: &str) -> Result<(), JsError> {
+        self.inner.set_align(match align {
+            "left" => Align::Left,
+            "center" => Align::Center,
+            "right" => Align::Right,
+            "justify" => Align::Justify,
+            other => return Err(JsError::new(&format!("unknown alignment: {other}"))),
+        });
+        Ok(())
+    }
+
     /// Insert an inline image at the caret. `width`/`height` are the display
     /// size in px. Supported types: PNG, JPEG, GIF, WebP, BMP.
     pub fn insert_image(
@@ -386,6 +424,17 @@ impl Editor {
                 has_selection: self.inner.has_selection(),
                 in_table: self.inner.in_table(),
                 image_selected: self.inner.image_selected(),
+                size: fmt
+                    .size
+                    .unwrap_or_else(|| (para_size(self.inner.current_kind()) * 1.5).round() as u16),
+                font: fmt.font.as_deref().map(str::to_owned),
+                color: fmt.color,
+                align: match self.inner.current_align() {
+                    Align::Left => "left",
+                    Align::Center => "center",
+                    Align::Right => "right",
+                    Align::Justify => "justify",
+                },
             },
             layout: &l,
         };

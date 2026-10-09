@@ -6,10 +6,13 @@
 //! All coordinates are page-local: `x`/`y` include the page margin, and each
 //! line records the page it sits on.
 
-use quill_core::{Document, Format, Image, Kind, Paragraph, Pos, OBJECT_CHAR};
+use std::sync::Arc;
+
+use quill_core::{Align, Document, Format, Image, Kind, Paragraph, Pos, OBJECT_CHAR};
 use serde::Serialize;
 
-pub const BASE_SIZE: f32 = 17.0;
+/// Default body text size in CSS px (12 pt).
+pub const BASE_SIZE: f32 = 16.0;
 pub const LINE_FACTOR: f32 = 1.4;
 pub const PARA_SPACING: f32 = 8.0;
 pub const INDENT: f32 = 32.0;
@@ -17,12 +20,15 @@ const MARKER_GAP: f32 = 8.0;
 const PARA_MARK_WIDTH: f32 = 6.0;
 pub const CELL_PAD: f32 = 6.0;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct TextStyle {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    /// Size in CSS px.
     pub size: f32,
+    pub font: Option<Arc<str>>,
+    pub color: Option<u32>,
 }
 
 pub trait Measure {
@@ -50,11 +56,17 @@ impl PageSetup {
     };
 }
 
+/// Convert half-points (the unit stored in documents) to CSS px.
+pub fn hp_to_px(half_points: u16) -> f32 {
+    half_points as f32 * 2.0 / 3.0
+}
+
+/// Default text size of a paragraph kind, in CSS px.
 pub fn para_size(kind: Kind) -> f32 {
     match kind {
-        Kind::Heading(1) => 28.0,
-        Kind::Heading(2) => 22.0,
-        Kind::Heading(_) => 19.0,
+        Kind::Heading(1) => hp_to_px(40),
+        Kind::Heading(2) => hp_to_px(32),
+        Kind::Heading(_) => hp_to_px(28),
         _ => BASE_SIZE,
     }
 }
@@ -64,7 +76,9 @@ fn style_for(kind: Kind, f: &Format) -> TextStyle {
         bold: f.bold || matches!(kind, Kind::Heading(_)),
         italic: f.italic,
         underline: f.underline,
-        size: para_size(kind),
+        size: f.size.map_or_else(|| para_size(kind), hp_to_px),
+        font: f.font.clone(),
+        color: f.color,
     }
 }
 
@@ -87,6 +101,10 @@ pub struct Item {
     pub italic: bool,
     pub underline: bool,
     pub size: f32,
+    pub font: Option<Arc<str>>,
+    pub color: Option<u32>,
+    /// Measured width of `text`.
+    pub w: f32,
     /// Char offset of `text` within its paragraph.
     pub start: usize,
     /// Set for an inline image; `text` is then a single object character.
@@ -100,6 +118,8 @@ impl Item {
             italic: self.italic,
             underline: self.underline,
             size: self.size,
+            font: self.font.clone(),
+            color: self.color,
         }
     }
 
@@ -124,6 +144,8 @@ pub struct Line {
     pub height: f32,
     /// Distance from `y` to the text baseline.
     pub baseline: f32,
+    /// Space below the baseline; `height == baseline + descent`.
+    pub descent: f32,
     pub items: Vec<Item>,
     /// Paragraph char range covered by this line.
     pub start: usize,
@@ -212,6 +234,73 @@ impl Pager {
     }
 }
 
+/// Add an item to a line, growing the line to fit it.
+fn push_item(line: &mut Line, it: Item, ascent: f32, descent: f32) {
+    if line.items.is_empty() {
+        // The first item replaces the empty-line defaults.
+        (line.baseline, line.descent) = (ascent, descent);
+    } else {
+        line.baseline = line.baseline.max(ascent);
+        line.descent = line.descent.max(descent);
+    }
+    line.height = line.baseline + line.descent;
+    line.items.push(it);
+}
+
+fn shift(line: &mut Line, dx: f32) {
+    line.x += dx;
+    for it in &mut line.items {
+        it.x += dx;
+    }
+}
+
+/// Apply paragraph alignment to finished lines. Trailing whitespace does not
+/// count towards a line's width, and justify leaves the last line alone.
+fn align_lines(lines: &mut [Line], align: Align, x0: f32, avail: f32, m: &dyn Measure) {
+    if align == Align::Left {
+        return;
+    }
+    let count = lines.len();
+    for (li, line) in lines.iter_mut().enumerate() {
+        let content_w = line.items.last().map_or(0.0, |it| {
+            let trimmed = it.text.trim_end();
+            let w = if it.image.is_some() || trimmed.len() == it.text.len() {
+                it.w
+            } else {
+                m.width(trimmed, &it.style())
+            };
+            it.x + w - x0
+        });
+        let slack = (avail - content_w).max(0.0);
+        match align {
+            Align::Center => shift(line, slack / 2.0),
+            Align::Right => shift(line, slack),
+            Align::Justify => {
+                let hard_break = line.items.last().is_some_and(|i| i.text.ends_with('\n'));
+                let n = line.items.len();
+                let gaps = line.items[..n.saturating_sub(1)]
+                    .iter()
+                    .filter(|i| i.image.is_none() && i.text.ends_with(char::is_whitespace))
+                    .count();
+                if li + 1 < count && !hard_break && gaps > 0 {
+                    let extra = slack / gaps as f32;
+                    let mut acc = 0.0;
+                    for i in 0..n {
+                        line.items[i].x += acc;
+                        if i + 1 < n
+                            && line.items[i].image.is_none()
+                            && line.items[i].text.ends_with(char::is_whitespace)
+                        {
+                            acc += extra;
+                        }
+                    }
+                }
+            }
+            Align::Left => {}
+        }
+    }
+}
+
 /// Lay out one paragraph inside a container spanning `[left, left + width]`.
 /// Lines come back with `y` and `page` unset (0); the caller places them.
 fn para_lines(
@@ -224,7 +313,6 @@ fn para_lines(
     m: &dyn Measure,
 ) -> Vec<Line> {
     let size = para_size(para.kind);
-    let height = size * LINE_FACTOR;
     let indent = if para.kind.is_list() { INDENT } else { 0.0 };
     let avail = width - indent;
     let x0 = left + indent;
@@ -244,13 +332,15 @@ fn para_lines(
         }
         _ => None,
     };
+    // An empty line is as tall as the paragraph's default text.
     let new_line = |start: usize, marker: Option<Marker>| Line {
         para: pi,
         page: 0,
         x: x0,
         y: 0.0,
-        height,
+        height: size * LINE_FACTOR,
         baseline: size,
+        descent: size * (LINE_FACTOR - 1.0),
         items: vec![],
         start,
         end: start,
@@ -264,22 +354,27 @@ fn para_lines(
     let (mut x, mut offset) = (0.0f32, 0usize);
     for run in &para.runs {
         let st = style_for(para.kind, &run.format);
-        let item = |x: f32, text: &str, start: usize| Item {
+        let descent = st.size * (LINE_FACTOR - 1.0);
+        let item = |x: f32, text: &str, start: usize, w: f32| Item {
             x: x0 + x,
             text: text.to_string(),
             bold: st.bold,
             italic: st.italic,
             underline: st.underline,
             size: st.size,
+            font: st.font.clone(),
+            color: st.color,
+            w,
             start,
             image: None,
         };
         if let Some(id) = run.format.image {
             // One inline image per object character.
             for _ in run.text.chars() {
-                let (uid, mut w, mut h) = images.get(id as usize).map_or((0, size, size), |i| {
-                    (i.uid, i.width as f32, i.height as f32)
-                });
+                let (uid, mut w, mut h) =
+                    images.get(id as usize).map_or((0, st.size, st.size), |i| {
+                        (i.uid, i.width as f32, i.height as f32)
+                    });
                 if w > avail {
                     h *= avail / w;
                     w = avail;
@@ -289,14 +384,12 @@ fn para_lines(
                     lines.push(std::mem::replace(&mut cur, new_line(offset, None)));
                     x = 0.0;
                 }
-                let mut it = item(x, &OBJECT_CHAR.to_string(), offset);
+                let mut it = item(x, &OBJECT_CHAR.to_string(), offset, w);
                 it.image = Some(ImageBox { id, uid, w, h });
-                cur.items.push(it);
+                // The image sits on the baseline; the line grows to hold it.
+                push_item(&mut cur, it, h, descent);
                 x += w;
                 offset += 1;
-                // The image sits on the baseline; the line grows to hold it.
-                cur.baseline = cur.baseline.max(h);
-                cur.height = cur.baseline + size * (LINE_FACTOR - 1.0);
             }
             continue;
         }
@@ -322,8 +415,9 @@ fn para_lines(
                         j += 1;
                     }
                     let chunk: String = chars[i..j].iter().collect();
-                    cur.items.push(item(x, &chunk, offset + i));
-                    x += m.width(&chunk, &st);
+                    let cw = m.width(&chunk, &st);
+                    push_item(&mut cur, item(x, &chunk, offset + i, cw), st.size, descent);
+                    x += cw;
                     i = j;
                     if i < chars.len() {
                         cur.end = offset + i;
@@ -332,7 +426,7 @@ fn para_lines(
                     }
                 }
             } else {
-                cur.items.push(item(x, tok, offset));
+                push_item(&mut cur, item(x, tok, offset, w), st.size, descent);
                 x += w;
             }
             offset += n;
@@ -345,6 +439,7 @@ fn para_lines(
     }
     cur.end = offset;
     lines.push(cur);
+    align_lines(&mut lines, para.align, x0, avail, m);
     lines
 }
 
@@ -680,17 +775,20 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quill_core::Paragraph;
+    use quill_core::{Align, Paragraph};
+
+    /// Height of a default text line.
+    const LH: f32 = BASE_SIZE * LINE_FACTOR;
 
     // 10px per char; ignores style.
     fn m(t: &str, _: &TextStyle) -> f32 {
         t.chars().count() as f32 * 10.0
     }
 
-    // 100px content width, 40px margins, 4 lines (of 23.8px) per page.
+    // 100px content width, 40px margins, 4 lines (of LHpx) per page.
     const SETUP: PageSetup = PageSetup {
         width: 180.0,
-        height: 80.0 + 4.0 * 23.8 + 1.0,
+        height: 80.0 + 4.0 * LH + 1.0,
         margin: 40.0,
     };
 
@@ -776,7 +874,7 @@ mod tests {
     fn heading_is_larger_and_bold() {
         let d = Document::from_paragraphs(vec![Paragraph::plain("T").with_kind(Kind::Heading(1))]);
         let l = layout(&d, SETUP, &m);
-        assert_eq!(l.lines[0].items[0].size, 28.0);
+        assert_eq!(l.lines[0].items[0].size, para_size(Kind::Heading(1)));
         assert!(l.lines[0].items[0].bold);
         assert!(l.lines[0].height > BASE_SIZE * LINE_FACTOR);
     }
@@ -792,7 +890,7 @@ mod tests {
             },
             &m,
         );
-        assert_eq!((c.x, c.y), (SETUP.margin, SETUP.margin + 23.8));
+        assert_eq!((c.x, c.y), (SETUP.margin, SETUP.margin + LH));
     }
 
     #[test]
@@ -914,7 +1012,7 @@ mod tests {
             "cells in a row are equally tall"
         );
         assert!(
-            l.cells[0].h > 23.8 + 2.0 * CELL_PAD,
+            l.cells[0].h > LH + 2.0 * CELL_PAD,
             "tall cell forces taller row"
         );
         assert!(
@@ -1066,5 +1164,140 @@ mod tests {
         let r = l.selection_rects(Pos { para: 0, offset: 2 }, Pos { para: 0, offset: 3 }, &m);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].w, 30.0);
+    }
+
+    fn sized(runs: &[(&str, Option<u16>)]) -> Document {
+        let mut p = Paragraph::default();
+        for (t, size) in runs {
+            p.runs.push(quill_core::Run::new(
+                *t,
+                Format {
+                    size: *size,
+                    ..Format::default()
+                },
+            ));
+        }
+        Document::from_paragraphs(vec![p])
+    }
+
+    #[test]
+    fn mixed_sizes_share_a_baseline_and_grow_the_line() {
+        // 48 half-points = 24pt = 32px.
+        let d = sized(&[("ab ", None), ("CD", Some(48)), (" ef", None)]);
+        let l = layout(&d, SETUP, &m);
+        let line = &l.lines[0];
+        let sizes: Vec<_> = line.items.iter().map(|i| i.size).collect();
+        assert_eq!(
+            sizes,
+            [BASE_SIZE, 32.0, BASE_SIZE, BASE_SIZE],
+            "ab | CD | space | ef"
+        );
+        assert_eq!(line.baseline, 32.0, "tallest text sets the baseline");
+        assert!((line.height - 32.0 * LINE_FACTOR).abs() < 1e-3);
+        // A line of only small text is back to the default height.
+        let small = layout(&sized(&[("ab", None)]), SETUP, &m);
+        assert!((small.lines[0].height - LH).abs() < 1e-3);
+        // Lone small text in a paragraph is shorter than the default line.
+        let tiny = layout(&sized(&[("ab", Some(12))]), SETUP, &m); // 6pt = 8px
+        assert!(tiny.lines[0].height < LH);
+    }
+
+    #[test]
+    fn font_and_color_reach_items() {
+        let mut p = Paragraph::plain("hi");
+        p.runs[0].format.font = Some("Courier New".into());
+        p.runs[0].format.color = Some(0xFF0000);
+        let l = layout(&Document::from_paragraphs(vec![p]), SETUP, &m);
+        let it = &l.lines[0].items[0];
+        assert_eq!(it.font.as_deref(), Some("Courier New"));
+        assert_eq!(it.color, Some(0xFF0000));
+    }
+
+    fn aligned(text: &str, align: Align) -> Layout {
+        let mut p = Paragraph::plain(text);
+        p.align = align;
+        layout(&Document::from_paragraphs(vec![p]), SETUP, &m)
+    }
+
+    #[test]
+    fn center_and_right_ignore_trailing_space() {
+        // width 100; "ab cd" fits on a line: "ab " + "cd" = 50 wide.
+        let c = aligned("ab cd", Align::Center);
+        assert_eq!(c.lines[0].items[0].x, SETUP.margin + 25.0);
+        let r = aligned("ab cd", Align::Right);
+        assert_eq!(
+            r.lines[0].items[1].x + 20.0,
+            SETUP.margin + 100.0,
+            "text ends at the right edge"
+        );
+        // Trailing space on the last item is not counted.
+        let t = aligned("ab cd ", Align::Right);
+        assert_eq!(t.lines[0].items[1].x + 20.0, SETUP.margin + 100.0);
+    }
+
+    #[test]
+    fn caret_follows_alignment_even_on_empty_lines() {
+        let c = aligned("", Align::Center);
+        let caret = c.caret(Pos::default(), &m);
+        assert_eq!(caret.x, SETUP.margin + 50.0);
+        let r = aligned("ab", Align::Right);
+        assert_eq!(
+            r.caret(Pos { para: 0, offset: 2 }, &m).x,
+            SETUP.margin + 100.0
+        );
+        assert_eq!(
+            r.hit_test(0, SETUP.margin + 95.0, SETUP.margin + 2.0, &m)
+                .offset,
+            2
+        );
+    }
+
+    #[test]
+    fn justify_stretches_wrapped_lines_but_not_the_last_or_forced_breaks() {
+        // "aaaa bbbb cccc": line 1 is "aaaa bbbb" (trimmed width 90, one gap).
+        let j = aligned("aaaa bbbb cccc", Align::Justify);
+        assert_eq!(j.lines.len(), 2);
+        let first = &j.lines[0];
+        assert_eq!(first.items[0].x, SETUP.margin);
+        assert_eq!(
+            first.items[1].x + 40.0,
+            SETUP.margin + 100.0,
+            "last word reaches the right edge"
+        );
+        assert_eq!(
+            j.lines[1].items[0].x, SETUP.margin,
+            "last line stays left-aligned"
+        );
+
+        let mut p = Paragraph::plain("a b\nc d");
+        p.align = Align::Justify;
+        let l = layout(&Document::from_paragraphs(vec![p]), SETUP, &m);
+        assert_eq!(
+            l.lines[0].items[1].x,
+            SETUP.margin + 20.0,
+            "line ended by a break is not stretched"
+        );
+    }
+
+    #[test]
+    fn alignment_applies_inside_list_indent_and_table_cells() {
+        let mut p = Paragraph::plain("ab").with_kind(Kind::Bullet);
+        p.align = Align::Right;
+        let l = layout(&Document::from_paragraphs(vec![p]), SETUP, &m);
+        assert_eq!(l.lines[0].items[0].x + 20.0, SETUP.margin + 100.0);
+        assert!(
+            l.lines[0].marker.as_ref().unwrap().x < SETUP.margin + INDENT,
+            "marker stays at the indent"
+        );
+
+        let mut d = table_doc(&[&["ab", "cd"]]);
+        d.paragraphs[1].align = Align::Right;
+        let l = layout(&d, WIDE, &m);
+        let ab = l
+            .lines
+            .iter()
+            .find(|l| l.items.first().is_some_and(|i| i.text == "ab"))
+            .unwrap();
+        assert_eq!(ab.items[0].x + 20.0, ab.right);
     }
 }

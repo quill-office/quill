@@ -23,6 +23,15 @@ pub struct Format {
     /// Index into `Document::images`. Set only on runs made of `OBJECT_CHAR`s.
     #[serde(default)]
     pub image: Option<u32>,
+    /// Font size in half-points (as in `.docx`); `None` follows the paragraph style.
+    #[serde(default)]
+    pub size: Option<u16>,
+    /// Font family name; `None` is the document default.
+    #[serde(default)]
+    pub font: Option<Arc<str>>,
+    /// Text colour as `0xRRGGBB`; `None` is the default text colour.
+    #[serde(default)]
+    pub color: Option<u32>,
 }
 
 /// Placeholder character standing for one inline image in paragraph text.
@@ -84,6 +93,15 @@ impl Format {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Align {
+    #[default]
+    Left,
+    Center,
+    Right,
+    Justify,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     #[default]
     Normal,
@@ -141,6 +159,8 @@ impl Cell {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Paragraph {
     pub kind: Kind,
+    #[serde(default)]
+    pub align: Align,
     pub runs: Vec<Run>,
     #[serde(default)]
     pub cell: Option<Cell>,
@@ -195,10 +215,11 @@ impl Paragraph {
         last.cloned().unwrap_or_default()
     }
 
-    /// Split into (before, after) at `offset`; both keep this paragraph's kind and cell.
+    /// Split into (before, after) at `offset`; both keep this paragraph's kind, alignment and cell.
     fn split_at(&self, offset: usize) -> (Paragraph, Paragraph) {
         let mk = || Paragraph {
             kind: self.kind,
+            align: self.align,
             runs: vec![],
             cell: self.cell,
         };
@@ -399,9 +420,8 @@ impl Document {
             let p = &self.paragraphs[i];
             if p.cell.is_some() {
                 keep.push(Paragraph {
-                    kind: Kind::Normal,
-                    runs: vec![],
                     cell: p.cell,
+                    ..Default::default()
                 });
             }
         }
