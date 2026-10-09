@@ -38,6 +38,7 @@ struct State {
     can_redo: bool,
     has_selection: bool,
     in_table: bool,
+    image_selected: bool,
 }
 
 #[derive(Serialize)]
@@ -217,6 +218,49 @@ impl Editor {
         Ok(())
     }
 
+    /// Insert an inline image at the caret. `width`/`height` are the display
+    /// size in px. Supported types: PNG, JPEG, GIF, WebP, BMP.
+    pub fn insert_image(
+        &mut self,
+        data: &[u8],
+        mime: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<(), JsError> {
+        if !matches!(
+            mime,
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp"
+        ) {
+            return Err(JsError::new(&format!("unsupported image type: {mime}")));
+        }
+        self.goal_x = None;
+        self.inner.insert_image(mime, data.to_vec(), width, height);
+        Ok(())
+    }
+
+    /// Scale the selected image(s) by `factor`.
+    pub fn scale_images(&mut self, factor: f32) {
+        self.inner.scale_selected_images(factor);
+    }
+
+    pub fn image_data(&self, id: u32) -> Result<Vec<u8>, JsError> {
+        self.inner
+            .doc()
+            .images
+            .get(id as usize)
+            .map(|i| i.data.to_vec())
+            .ok_or_else(|| JsError::new("no such image"))
+    }
+
+    pub fn image_mime(&self, id: u32) -> Result<String, JsError> {
+        self.inner
+            .doc()
+            .images
+            .get(id as usize)
+            .map(|i| i.mime.clone())
+            .ok_or_else(|| JsError::new("no such image"))
+    }
+
     /// Insert a `rows` × `cols` table at the caret (no-op inside a table).
     pub fn insert_table(&mut self, rows: usize, cols: usize) {
         self.goal_x = None;
@@ -341,6 +385,7 @@ impl Editor {
                 can_redo: self.inner.can_redo(),
                 has_selection: self.inner.has_selection(),
                 in_table: self.inner.in_table(),
+                image_selected: self.inner.image_selected(),
             },
             layout: &l,
         };

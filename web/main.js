@@ -29,6 +29,7 @@ Quill is an open-source office suite written in Rust and compiled to WebAssembly
 - Undo and redo, cut, copy and paste
 - Bold, italic and underline; headings; bulleted and numbered lists
 - Tables: use the Table button, then Tab to move between cells
+- Images: use the Image button, or paste or drop one onto the page
 - Pages, wrapping, and opening or saving .docx files
 ## Try it
 1. Press Ctrl+Z after typing to undo a burst of typing at once
@@ -53,6 +54,27 @@ function ensureCanvases(n) {
   while (canvases.length > n) canvases.pop().remove();
 }
 
+// Decoded images, keyed by the pixel data's uid (stable across undo/redo).
+const imageCache = new Map();
+function cachedImage(it) {
+  let entry = imageCache.get(it.image.uid);
+  if (!entry) {
+    const url = URL.createObjectURL(new Blob([editor.image_data(it.image.id)], { type: editor.image_mime(it.image.id) }));
+    const img = new Image();
+    img.onload = () => paint();
+    img.src = url;
+    entry = img;
+    imageCache.set(it.image.uid, entry);
+  }
+  return entry;
+}
+function drawImage(ctx, it, baseline) {
+  const { w, h } = it.image;
+  const img = cachedImage(it);
+  if (img.complete && img.naturalWidth) ctx.drawImage(img, it.x, baseline - h, w, h);
+  else { ctx.fillStyle = "#e5e7eb"; ctx.fillRect(it.x, baseline - h, w, h); ctx.fillStyle = TEXT_COLOR; }
+}
+
 function paint() {
   if (!frame) return;
   const focused = document.activeElement === ime;
@@ -63,8 +85,6 @@ function paint() {
     ctx.strokeStyle = "#9aa0a6";
     ctx.lineWidth = 1;
     for (const c of frame.layout.cells) if (c.page === p) ctx.strokeRect(c.x + 0.5, c.y + 0.5, c.w, c.h);
-    ctx.fillStyle = SELECTION_COLOR;
-    for (const r of frame.selection) if (r.page === p) ctx.fillRect(r.x, r.y, r.w, r.h);
     ctx.fillStyle = TEXT_COLOR;
     ctx.textBaseline = "alphabetic";
     for (const line of frame.layout.lines) {
@@ -79,6 +99,7 @@ function paint() {
         ctx.fillText(line.marker.text, line.marker.x, by);
       }
       for (const it of line.items) {
+        if (it.image) { drawImage(ctx, it, by); continue; }
         ctx.font = fontFor(it.bold, it.italic, it.size);
         ctx.fillText(it.text, it.x, by);
         if (it.underline) {
@@ -87,6 +108,8 @@ function paint() {
         }
       }
     }
+    ctx.fillStyle = SELECTION_COLOR;
+    for (const r of frame.selection) if (r.page === p) ctx.fillRect(r.x, r.y, r.w, r.h);
     const c = frame.caret;
     if (blink && focused && c.page === p && !frame.state.has_selection) {
       ctx.fillStyle = CARET_COLOR;
@@ -101,11 +124,12 @@ function updateToolbar() {
   for (const b of document.querySelectorAll("[data-kind]")) b.setAttribute("aria-pressed", String(s.kind === b.dataset.kind));
   const sel = $("kind");
   sel.value = ["normal", "h1", "h2", "h3"].includes(s.kind) ? s.kind : "normal";
+  $("imageTools").hidden = !s.image_selected;
   $("tableTools").hidden = !s.in_table;
   $("table").disabled = s.in_table;
   $("undo").disabled = !s.can_undo;
   $("redo").disabled = !s.can_redo;
-  const words = editor.text().split(/\s+/).filter(Boolean).length;
+  const words = editor.text().replace(/\uFFFC/g, " ").split(/\s+/).filter(Boolean).length;
   statusEl.textContent = `Page ${frame.caret.page + 1} of ${frame.layout.pages} · ${words} words`;
 }
 
@@ -235,6 +259,8 @@ ime.addEventListener("cut", (e) => {
   refresh();
 });
 ime.addEventListener("paste", (e) => {
+  const imageFile = [...(e.clipboardData.files ?? [])].find((f) => f.type.startsWith("image/"));
+  if (imageFile) { e.preventDefault(); insertImageFile(imageFile); return; }
   const t = e.clipboardData.getData("text/plain").replace(/\r\n?/g, "\n");
   e.preventDefault();
   if (t) { editor.insert_text(t); refresh(); }
@@ -256,6 +282,45 @@ for (const b of document.querySelectorAll("[data-kind]")) b.onclick = act(() => 
 $("table").onclick = act(() => editor.insert_table(3, 3));
 for (const b of document.querySelectorAll("[data-table]")) b.onclick = act(() => editor.table_op(b.dataset.table));
 $("kind").onchange = act(() => editor.toggle_kind($("kind").value));
+
+// ---- images -----------------------------------------------------------------
+
+const MAX_IMAGE_W = 600;
+const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"];
+
+async function insertImageFile(f) {
+  if (!IMAGE_TYPES.includes(f.type)) { alert(`${f.name || "That file"} isn't a supported image (PNG, JPEG, GIF, WebP or BMP).`); return; }
+  try {
+    const bitmap = await createImageBitmap(f);
+    const scale = Math.min(1, MAX_IMAGE_W / bitmap.width);
+    const [w, h] = [Math.max(1, Math.round(bitmap.width * scale)), Math.max(1, Math.round(bitmap.height * scale))];
+    bitmap.close();
+    editor.insert_image(new Uint8Array(await f.arrayBuffer()), f.type, w, h);
+  } catch (err) {
+    alert(`Could not insert ${f.name || "image"}: ${err.message ?? err}`);
+    return;
+  }
+  ime.focus();
+  refresh();
+}
+
+$("image").onclick = () => $("imageFile").click();
+$("imageFile").onchange = async () => {
+  const f = $("imageFile").files[0];
+  $("imageFile").value = "";
+  if (f) await insertImageFile(f);
+};
+$("imgSmaller").onclick = act(() => editor.scale_images(0.8));
+$("imgLarger").onclick = act(() => editor.scale_images(1.25));
+pagesEl.addEventListener("dragover", (e) => { if ([...e.dataTransfer.types].includes("Files")) e.preventDefault(); });
+pagesEl.addEventListener("drop", async (e) => {
+  const f = [...e.dataTransfer.files].find((f) => f.type.startsWith("image/"));
+  if (!f) return;
+  e.preventDefault();
+  const p = locate(e.clientX, e.clientY);
+  editor.click(p.page, p.x, p.y, false, 1);
+  await insertImageFile(f);
+});
 
 const file = $("file");
 $("open").onclick = () => file.click();

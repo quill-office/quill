@@ -73,9 +73,10 @@ impl Editor {
         (self.anchor.min(self.head), self.anchor.max(self.head))
     }
 
+    /// Selected text for the clipboard (images are left out).
     pub fn selected_text(&self) -> String {
         let (s, e) = self.selection();
-        self.doc.text_in_range(s, e)
+        self.doc.text_in_range(s, e).replace(OBJECT_CHAR, "")
     }
 
     pub fn can_undo(&self) -> bool {
@@ -208,6 +209,8 @@ impl Editor {
 
     /// Type or paste text, replacing any selection.
     pub fn insert_text(&mut self, text: &str) {
+        let text = text.replace(OBJECT_CHAR, "");
+        let text = text.as_str();
         if text.is_empty() {
             return;
         }
@@ -300,6 +303,35 @@ impl Editor {
                 ed.doc.paragraphs[i].kind = to;
             }
         });
+    }
+
+    // ---- images ----------------------------------------------------------
+
+    /// Insert an inline image (display size in px) at the caret.
+    pub fn insert_image(&mut self, mime: &str, data: Vec<u8>, width: u32, height: u32) {
+        self.edit(Action::Other, |e| {
+            e.delete_selection();
+            e.head = e
+                .doc
+                .insert_image(e.head, Image::new(mime, data, width, height));
+            e.anchor = e.head;
+            e.pending = None;
+        });
+    }
+
+    pub fn image_selected(&self) -> bool {
+        let (s, e) = self.selection();
+        !self.doc.images_in_range(s, e).is_empty()
+    }
+
+    /// Scale every selected image by `factor`.
+    pub fn scale_selected_images(&mut self, factor: f32) {
+        let (s, e) = self.selection();
+        let ids = self.doc.images_in_range(s, e);
+        if ids.is_empty() {
+            return;
+        }
+        self.edit(Action::Other, |ed| ed.doc.scale_images(&ids, factor));
     }
 
     // ---- tables ----------------------------------------------------------
@@ -785,5 +817,70 @@ mod tests {
             "separator between tables and a trailing paragraph"
         );
         assert!(d.paragraphs.last().unwrap().cell.is_none());
+    }
+
+    fn png() -> Vec<u8> {
+        vec![0x89, b'P', b'N', b'G']
+    }
+
+    #[test]
+    fn insert_image_is_one_char_and_typing_after_it_is_text() {
+        let mut e = ed("ab");
+        e.set_cursor(Pos { para: 0, offset: 1 }, false);
+        e.insert_image("image/png", png(), 100, 50);
+        assert_eq!(e.doc().paragraphs[0].len(), 3);
+        assert_eq!(e.head(), Pos { para: 0, offset: 2 });
+        e.insert_text("X");
+        let runs = &e.doc().paragraphs[0].runs;
+        assert_eq!(runs.len(), 3, "a | image | Xb: {runs:?}");
+        assert_eq!(runs[1].format.image, Some(0));
+        assert_eq!(runs[2].format.image, None);
+        assert_eq!(runs[2].text, "Xb");
+        e.undo();
+        e.undo();
+        assert_eq!(e.doc().plain_text(), "ab");
+    }
+
+    #[test]
+    fn image_chars_never_leak_into_typed_or_copied_text() {
+        let mut e = ed("a");
+        e.insert_image("image/png", png(), 10, 10);
+        e.insert_text(&format!("x{OBJECT_CHAR}y"));
+        assert_eq!(e.doc().paragraphs[0].len(), 4);
+        e.select_all();
+        assert_eq!(e.selected_text(), "axy");
+    }
+
+    #[test]
+    fn select_scale_and_delete_image() {
+        let mut e = ed("");
+        e.insert_image("image/png", png(), 100, 40);
+        e.set_cursor(Pos { para: 0, offset: 0 }, false);
+        assert!(!e.image_selected());
+        e.select_word(Pos { para: 0, offset: 0 });
+        assert!(e.image_selected(), "double-click selects exactly the image");
+        e.scale_selected_images(2.0);
+        assert_eq!(
+            (e.doc().images[0].width, e.doc().images[0].height),
+            (200, 80)
+        );
+        e.scale_selected_images(0.001);
+        assert_eq!(e.doc().images[0].width, 16, "clamped");
+        e.undo();
+        assert_eq!(e.doc().images[0].width, 200);
+        e.backspace();
+        assert!(e.doc().paragraphs[0].is_empty());
+    }
+
+    #[test]
+    fn undo_does_not_clone_image_bytes() {
+        let mut e = ed("");
+        e.insert_image("image/png", vec![7; 1 << 20], 10, 10);
+        e.insert_text("a");
+        e.insert_text("b");
+        let first = e.doc().images[0].data.clone();
+        e.undo();
+        e.redo();
+        assert!(std::sync::Arc::ptr_eq(&first, &e.doc().images[0].data));
     }
 }

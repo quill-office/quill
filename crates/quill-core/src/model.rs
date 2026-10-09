@@ -3,6 +3,9 @@
 //! Positions are `(paragraph index, char offset)`; offsets count Unicode
 //! scalar values, not bytes.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,7 +20,50 @@ pub struct Format {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    /// Index into `Document::images`. Set only on runs made of `OBJECT_CHAR`s.
+    #[serde(default)]
+    pub image: Option<u32>,
 }
+
+/// Placeholder character standing for one inline image in paragraph text.
+pub const OBJECT_CHAR: char = '\u{FFFC}';
+
+static NEXT_UID: AtomicU64 = AtomicU64::new(1);
+
+/// An embedded raster image. `width`/`height` are the display size in CSS px.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Image {
+    /// Identifies the pixel data, so hosts can cache decoded images. Clones
+    /// (and resized copies) share it.
+    pub uid: u64,
+    pub mime: String,
+    pub data: Arc<[u8]>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Image {
+    pub fn new(mime: impl Into<String>, data: Vec<u8>, width: u32, height: u32) -> Self {
+        Self {
+            uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
+            mime: mime.into(),
+            data: data.into(),
+            width: width.max(1),
+            height: height.max(1),
+        }
+    }
+}
+
+impl PartialEq for Image {
+    fn eq(&self, o: &Self) -> bool {
+        self.width == o.width
+            && self.height == o.height
+            && self.mime == o.mime
+            && (Arc::ptr_eq(&self.data, &o.data) || self.data == o.data)
+    }
+}
+
+impl Eq for Image {}
 
 impl Format {
     pub fn get(&self, a: Attr) -> bool {
@@ -126,8 +172,16 @@ impl Paragraph {
         self.runs.iter().map(|r| r.text.as_str()).collect()
     }
 
-    /// Format of the character before `offset` (or the first run at 0).
+    /// Format of the character before `offset` (or the first run at 0). Never
+    /// carries an image, so typing after an image yields text.
     pub fn format_at(&self, offset: usize) -> Format {
+        Format {
+            image: None,
+            ..self.raw_format_at(offset)
+        }
+    }
+
+    fn raw_format_at(&self, offset: usize) -> Format {
         let mut pos = 0;
         let mut last = None;
         for r in &self.runs {
@@ -193,12 +247,15 @@ pub struct Pos {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Document {
     pub paragraphs: Vec<Paragraph>,
+    #[serde(default)]
+    pub images: Vec<Image>,
 }
 
 impl Default for Document {
     fn default() -> Self {
         Self {
             paragraphs: vec![Paragraph::default()],
+            images: vec![],
         }
     }
 }
@@ -208,10 +265,13 @@ enum CharClass {
     Word,
     Space,
     Other,
+    Object,
 }
 
 fn class(c: char) -> CharClass {
-    if c.is_alphanumeric() || c == '_' {
+    if c == OBJECT_CHAR {
+        CharClass::Object
+    } else if c.is_alphanumeric() || c == '_' {
         CharClass::Word
     } else if c.is_whitespace() {
         CharClass::Space
@@ -229,7 +289,10 @@ impl Document {
         if paragraphs.is_empty() {
             paragraphs.push(Paragraph::default());
         }
-        Self { paragraphs }
+        Self {
+            paragraphs,
+            images: vec![],
+        }
     }
 
     pub fn plain_text(&self) -> String {
@@ -594,6 +657,56 @@ impl Document {
         })
     }
 
+    /// Insert an inline image at `pos`; returns the position after it.
+    pub fn insert_image(&mut self, pos: Pos, image: Image) -> Pos {
+        let id = self.images.len() as u32;
+        self.images.push(image);
+        let fmt = Format {
+            image: Some(id),
+            ..Format::default()
+        };
+        self.insert_text(pos, &OBJECT_CHAR.to_string(), Some(&fmt))
+    }
+
+    /// Ids of the images inside `[start, end)`, in order, without repeats.
+    pub fn images_in_range(&self, start: Pos, end: Pos) -> Vec<u32> {
+        let (start, end) = (self.clamp(start), self.clamp(end));
+        let mut out = Vec::new();
+        if start >= end {
+            return out;
+        }
+        for pi in start.para..=end.para {
+            let s = if pi == start.para { start.offset } else { 0 };
+            let e = if pi == end.para {
+                end.offset
+            } else {
+                usize::MAX
+            };
+            let mut pos = 0;
+            for r in &self.paragraphs[pi].runs {
+                let n = r.len();
+                if let Some(id) = r.format.image {
+                    if pos.max(s) < (pos + n).min(e) && !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+                pos += n;
+            }
+        }
+        out
+    }
+
+    /// Multiply the display size of the given images (clamped to 16..=4000 px).
+    pub fn scale_images(&mut self, ids: &[u32], factor: f32) {
+        let scale = |v: u32| ((v as f32 * factor).round() as u32).clamp(16, 4000);
+        for &id in ids {
+            if let Some(img) = self.images.get_mut(id as usize) {
+                img.width = scale(img.width);
+                img.height = scale(img.height);
+            }
+        }
+    }
+
     pub fn text_in_range(&self, start: Pos, end: Pos) -> String {
         let (start, end) = (self.clamp(start), self.clamp(end));
         let mut out = String::new();
@@ -683,6 +796,18 @@ impl Document {
         }
         let at = pos.offset.min(chars.len() - 1);
         let k = class(chars[at]);
+        if k == CharClass::Object {
+            return (
+                Pos {
+                    para: pos.para,
+                    offset: at,
+                },
+                Pos {
+                    para: pos.para,
+                    offset: at + 1,
+                },
+            );
+        }
         let mut s = at;
         while s > 0 && class(chars[s - 1]) == k {
             s -= 1;

@@ -9,7 +9,7 @@ use std::io::{Cursor, Read, Write};
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
-use quill_core::{Cell, Document, Format, Kind, Paragraph, Run};
+use quill_core::{Cell, Document, Format, Image, Kind, Paragraph, Run, OBJECT_CHAR};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocxError {
@@ -45,7 +45,61 @@ pub fn read(bytes: &[u8]) -> Result<Document, DocxError> {
         Some(n) => parse_numbering(&n)?,
         None => HashMap::new(),
     };
-    parse_document_xml(&xml, &numbering)
+    let media = read_media(&mut zip)?;
+    parse_document_xml(&xml, &numbering, &media)
+}
+
+/// Embedded images by relationship id: `rId → (mime, bytes)`.
+type Media = HashMap<String, (String, Vec<u8>)>;
+
+fn mime_for(path: &str) -> Option<&'static str> {
+    match path.rsplit('.').next()?.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None, // e.g. EMF/WMF/TIFF: not renderable in browsers
+    }
+}
+
+fn read_media(zip: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<Media, DocxError> {
+    let mut media = Media::new();
+    let Some(rels) = read_part(zip, "word/_rels/document.xml.rels")? else {
+        return Ok(media);
+    };
+    let mut r = Reader::from_str(&rels);
+    loop {
+        match r.read_event()? {
+            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == "Relationship" => {
+                let (Some(id), Some(target), Some(kind)) =
+                    (attr(&e, "Id"), attr(&e, "Target"), attr(&e, "Type"))
+                else {
+                    continue;
+                };
+                if !kind.ends_with("/image")
+                    || attr(&e, "TargetMode").as_deref() == Some("External")
+                {
+                    continue;
+                }
+                let Some(mime) = mime_for(&target) else {
+                    continue;
+                };
+                let path = match target.strip_prefix('/') {
+                    Some(abs) => abs.to_string(),
+                    None => format!("word/{target}"),
+                };
+                if let Ok(mut f) = zip.by_name(&path) {
+                    let mut data = Vec::new();
+                    f.read_to_end(&mut data)?;
+                    media.insert(id, (mime.to_string(), data));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(media)
 }
 
 fn attr(e: &BytesStart, local: &str) -> Option<String> {
@@ -125,7 +179,11 @@ fn kind_from_style(id: &str) -> Option<Kind> {
     }
 }
 
-fn parse_document_xml(xml: &str, numbering: &HashMap<u32, bool>) -> Result<Document, DocxError> {
+fn parse_document_xml(
+    xml: &str,
+    numbering: &HashMap<u32, bool>,
+    media: &Media,
+) -> Result<Document, DocxError> {
     let mut r = Reader::from_str(xml);
     let mut paras: Vec<Paragraph> = Vec::new();
     let mut cur: Option<Paragraph> = None;
@@ -137,6 +195,14 @@ fn parse_document_xml(xml: &str, numbering: &HashMap<u32, bool>) -> Result<Docum
     // tables are folded into the enclosing cell.
     let (mut depth, mut tables, mut row, mut col) = (0u32, 0u32, -1i32, -1i32);
     let mut cell: Option<Cell> = None;
+    // Drawing state: display size (px) and the embedded image's relationship id.
+    let mut images: Vec<Image> = Vec::new();
+    let (mut in_drawing, mut extent, mut embed): (bool, Option<(u32, u32)>, Option<String>) =
+        (false, None, None);
+    let emu_to_px = |v: Option<String>| {
+        v.and_then(|v| v.parse::<u64>().ok())
+            .map(|v| (v / 9525) as u32)
+    };
     loop {
         match r.read_event()? {
             Event::Start(e) if e.local_name().as_ref() == "p" => {
@@ -149,6 +215,15 @@ fn parse_document_xml(xml: &str, numbering: &HashMap<u32, bool>) -> Result<Docum
                 ..Default::default()
             }),
             Event::Start(e) => match e.local_name().as_ref() {
+                "drawing" => {
+                    in_drawing = true;
+                    extent = None;
+                    embed = None;
+                }
+                "extent" if in_drawing => {
+                    extent = emu_to_px(attr(&e, "cx")).zip(emu_to_px(attr(&e, "cy")));
+                }
+                "blip" if in_drawing => embed = attr(&e, "embed"),
                 "tbl" => {
                     depth += 1;
                     if depth == 1 {
@@ -178,6 +253,10 @@ fn parse_document_xml(xml: &str, numbering: &HashMap<u32, bool>) -> Result<Docum
                 _ => {}
             },
             Event::Empty(e) => match e.local_name().as_ref() {
+                "extent" if in_drawing => {
+                    extent = emu_to_px(attr(&e, "cx")).zip(emu_to_px(attr(&e, "cy")));
+                }
+                "blip" if in_drawing => embed = attr(&e, "embed"),
                 "b" => fmt.bold = toggle_on(&e),
                 "i" => fmt.italic = toggle_on(&e),
                 "u" => fmt.underline = toggle_on(&e),
@@ -205,6 +284,21 @@ fn parse_document_xml(xml: &str, numbering: &HashMap<u32, bool>) -> Result<Docum
             }
             Event::End(e) => match e.local_name().as_ref() {
                 "t" => in_text = false,
+                "drawing" => {
+                    in_drawing = false;
+                    let found = embed.take().and_then(|rid| media.get(&rid));
+                    if let (Some((mime, data)), Some(p)) = (found, cur.as_mut()) {
+                        let (w, h) = extent.unwrap_or((200, 150));
+                        p.runs.push(Run::new(
+                            OBJECT_CHAR.to_string(),
+                            Format {
+                                image: Some(images.len() as u32),
+                                ..Format::default()
+                            },
+                        ));
+                        images.push(Image::new(mime.as_str(), data.clone(), w, h));
+                    }
+                }
                 "tc" if depth == 1 => cell = None,
                 "tbl" => {
                     depth = depth.saturating_sub(1);
@@ -226,7 +320,9 @@ fn parse_document_xml(xml: &str, numbering: &HashMap<u32, bool>) -> Result<Docum
             _ => {}
         }
     }
-    Ok(Document::from_paragraphs(paras))
+    let mut doc = Document::from_paragraphs(paras);
+    doc.images = images;
+    Ok(doc)
 }
 
 fn numbering_kind(e: &BytesStart, numbering: &HashMap<u32, bool>) -> Option<Kind> {
@@ -297,6 +393,8 @@ fn run_xml(text: &str, f: &Format) -> String {
 }
 
 const NS_W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const NS_R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const NS_WP: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
 const XML_DECL: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>";
 
 pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
@@ -308,6 +406,10 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
     let mut prev_cell: Option<Cell> = None;
     let mut open_table: Option<(u32, u16, u16)> = None; // (table, row, col) currently open
     let ncols_of = |t: u32| doc.table_dims(t).map_or(1, |d| d.1);
+
+    let mut media: Vec<(String, std::sync::Arc<[u8]>)> = Vec::new();
+    let mut media_ids: HashMap<u32, (String, String)> = HashMap::new(); // image id → (rId, file name)
+    let mut drawings = 0usize;
 
     for p in &doc.paragraphs {
         // Close cells/rows/tables as the paragraph's cell changes.
@@ -364,7 +466,26 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
         body.push_str("<w:p>");
         body.push_str(&ppr);
         for r in &p.runs {
-            body.push_str(&run_xml(&r.text, &r.format));
+            let image = r
+                .format
+                .image
+                .and_then(|id| doc.images.get(id as usize).map(|i| (id, i)));
+            let ext = image.and_then(|(_, i)| ext_for(&i.mime));
+            let (Some((id, img)), Some(ext)) = (image, ext) else {
+                if r.format.image.is_none() {
+                    body.push_str(&run_xml(&r.text, &r.format));
+                }
+                continue; // images we can't embed are dropped
+            };
+            let (rid, _) = media_ids.entry(id).or_insert_with(|| {
+                let n = media.len() + 1;
+                media.push((format!("image{n}.{ext}"), img.data.clone()));
+                (format!("rId{}", n + 2), format!("image{n}.{ext}"))
+            });
+            for _ in r.text.chars() {
+                drawings += 1;
+                body.push_str(&drawing_xml(rid, drawings, img.width, img.height));
+            }
         }
         body.push_str("</w:p>");
     }
@@ -372,7 +493,7 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
         body.push_str("</w:tc></w:tr></w:tbl><w:p/>"); // Word requires a paragraph after a table
     }
     let document =
-        format!("{XML_DECL}<w:document xmlns:w=\"{NS_W}\"><w:body>{body}</w:body></w:document>");
+        format!("{XML_DECL}<w:document xmlns:w=\"{NS_W}\" xmlns:r=\"{NS_R}\" xmlns:wp=\"{NS_WP}\"><w:body>{body}</w:body></w:document>");
 
     let mut nums = String::new();
     for i in 0..numbered_lists {
@@ -408,6 +529,11 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
         "{XML_DECL}<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
 <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
 <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Default Extension=\"png\" ContentType=\"image/png\"/>\
+<Default Extension=\"jpeg\" ContentType=\"image/jpeg\"/>\
+<Default Extension=\"gif\" ContentType=\"image/gif\"/>\
+<Default Extension=\"webp\" ContentType=\"image/webp\"/>\
+<Default Extension=\"bmp\" ContentType=\"image/bmp\"/>\
 <Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
 <Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>\
 <Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/></Types>"
@@ -416,10 +542,16 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
         "{XML_DECL}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
 <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>"
     );
+    let image_rels: String = media_ids
+        .values()
+        .map(|(rid, file)| {
+            format!("<Relationship Id=\"{rid}\" Type=\"{NS_R}/image\" Target=\"media/{file}\"/>")
+        })
+        .collect();
     let doc_rels = format!(
         "{XML_DECL}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
 <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>\
-<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/></Relationships>"
+<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>{image_rels}</Relationships>"
     );
 
     let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -435,12 +567,45 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
         z.start_file(name, opts)?;
         z.write_all(data.as_bytes())?;
     }
+    for (name, data) in &media {
+        z.start_file(format!("word/media/{name}"), opts)?;
+        z.write_all(data)?;
+    }
     Ok(z.finish()?.into_inner())
+}
+
+fn ext_for(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpeg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "image/bmp" => Some("bmp"),
+        _ => None,
+    }
+}
+
+/// An inline picture run; sizes are CSS px (9525 EMU each).
+fn drawing_xml(rid: &str, n: usize, w: u32, h: u32) -> String {
+    let (cx, cy) = (w as u64 * 9525, h as u64 * 9525);
+    format!(
+        "<w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
+<wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:docPr id=\"{n}\" name=\"Picture {n}\"/>\
+<a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+<a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+<pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+<pic:nvPicPr><pic:cNvPr id=\"{n}\" name=\"Picture {n}\"/><pic:cNvPicPr/></pic:nvPicPr>\
+<pic:blipFill><a:blip r:embed=\"{rid}\"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
+<pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
+<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>\
+</wp:inline></w:drawing></w:r>"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quill_core::Pos;
 
     #[test]
     fn round_trip_formats_kinds_and_special_chars() {
@@ -491,7 +656,7 @@ mod tests {
     #[test]
     fn toggle_off_values_are_respected() {
         let xml = r#"<w:document xmlns:w="x"><w:body><w:p><w:r><w:rPr><w:b w:val="0"/><w:u w:val="none"/></w:rPr><w:t>a</w:t></w:r></w:p></w:body></w:document>"#;
-        let d = parse_document_xml(xml, &HashMap::new()).unwrap();
+        let d = parse_document_xml(xml, &HashMap::new(), &Media::new()).unwrap();
         assert_eq!(d.paragraphs[0].runs[0].format, Format::default());
     }
 
@@ -506,7 +671,7 @@ mod tests {
     #[test]
     fn empty_paragraphs_survive() {
         let xml = r#"<w:document xmlns:w="x"><w:body><w:p/><w:p><w:r><w:t>a</w:t></w:r></w:p></w:body></w:document>"#;
-        let d = parse_document_xml(xml, &HashMap::new()).unwrap();
+        let d = parse_document_xml(xml, &HashMap::new(), &Media::new()).unwrap();
         assert_eq!(d.paragraphs.len(), 2);
     }
 
@@ -567,7 +732,7 @@ mod tests {
     fn nested_table_paragraphs_fold_into_outer_cell() {
         let xml = r#"<w:document xmlns:w="x"><w:body><w:tbl><w:tr><w:tc><w:p><w:r><w:t>outer</w:t></w:r></w:p>
             <w:tbl><w:tr><w:tc><w:p><w:r><w:t>inner</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:tc><w:tc><w:p><w:r><w:t>next</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>"#;
-        let d = parse_document_xml(xml, &HashMap::new()).unwrap();
+        let d = parse_document_xml(xml, &HashMap::new(), &Media::new()).unwrap();
         let cells: Vec<_> = d
             .paragraphs
             .iter()
@@ -577,5 +742,69 @@ mod tests {
             cells,
             vec![(0, "outer".into()), (0, "inner".into()), (1, "next".into())]
         );
+    }
+
+    fn png_bytes(tag: u8) -> Vec<u8> {
+        vec![0x89, b'P', b'N', b'G', tag]
+    }
+
+    #[test]
+    fn images_round_trip_with_media_and_sizes() {
+        let mut d =
+            Document::from_paragraphs(vec![Paragraph::plain("before after"), Paragraph::plain("")]);
+        d.insert_image(
+            Pos { para: 0, offset: 6 },
+            Image::new("image/png", png_bytes(1), 120, 60),
+        );
+        d.insert_image(
+            Pos { para: 1, offset: 0 },
+            Image::new("image/jpeg", vec![0xFF, 0xD8, 9], 33, 44),
+        );
+        let bytes = write(&d).unwrap();
+        let back = read(&bytes).unwrap();
+        assert_eq!(back, d);
+        assert_eq!(back.images.len(), 2);
+
+        let mut z = zip::ZipArchive::new(Cursor::new(&bytes[..])).unwrap();
+        let mut got = Vec::new();
+        z.by_name("word/media/image1.png")
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, png_bytes(1));
+        assert!(z.by_name("word/media/image2.jpeg").is_ok());
+        let xml = read_part(&mut z, "word/document.xml").unwrap().unwrap();
+        assert!(
+            xml.contains("cx=\"1143000\"") && xml.contains("cy=\"571500\""),
+            "120×60 px in EMU"
+        );
+    }
+
+    #[test]
+    fn unsupported_image_types_are_dropped_not_corrupting() {
+        let mut d = Document::from_paragraphs(vec![Paragraph::plain("ab")]);
+        d.insert_image(
+            Pos { para: 0, offset: 1 },
+            Image::new("image/svg+xml", b"<svg/>".to_vec(), 10, 10),
+        );
+        let back = read(&write(&d).unwrap()).unwrap();
+        assert_eq!(back.plain_text(), "ab");
+        assert!(back.images.is_empty());
+    }
+
+    #[test]
+    fn anchored_images_and_missing_media_are_handled() {
+        let xml = r#"<w:document xmlns:w="w" xmlns:wp="wp" xmlns:a="a" xmlns:r="r"><w:body><w:p>
+            <w:r><w:t>x</w:t></w:r>
+            <w:r><w:drawing><wp:anchor><wp:extent cx="952500" cy="476250"/><wp:effectExtent l="0" t="0" r="0" b="0"/>
+              <a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed="rId9"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>
+            <w:r><w:drawing><wp:inline><wp:extent cx="1" cy="1"/><a:blip r:embed="rId404"/></wp:inline></w:drawing></w:r>
+            </w:p></w:body></w:document>"#;
+        let mut media = Media::new();
+        media.insert("rId9".into(), ("image/png".into(), png_bytes(5)));
+        let d = parse_document_xml(xml, &HashMap::new(), &media).unwrap();
+        assert_eq!(d.images.len(), 1, "unresolvable relationship is skipped");
+        assert_eq!((d.images[0].width, d.images[0].height), (100, 50));
+        assert_eq!(d.paragraphs[0].len(), 2);
     }
 }

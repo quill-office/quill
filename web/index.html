@@ -50,6 +50,11 @@
   <button id="bullet" data-kind="bullet" title="Bulleted list" aria-label="Bulleted list">• List</button>
   <button id="numbered" data-kind="numbered" title="Numbered list" aria-label="Numbered list">1. List</button>
   <span class="sep"></span>
+  <button id="image" title="Insert image (or paste / drop one)">🖼 Image</button>
+  <span id="imageTools" hidden>
+    <button id="imgSmaller" title="Make image smaller">Img −</button>
+    <button id="imgLarger" title="Make image larger">Img +</button>
+  </span>
   <button id="table" title="Insert a 3×3 table">▦ Table</button>
   <span id="tableTools" hidden>
     <button data-table="add_row" title="Add row below">+Row</button>
@@ -60,6 +65,7 @@
   </span>
   <span id="status">loading…</span>
   <input id="file" type="file" accept=".docx" hidden>
+  <input id="imageFile" type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/bmp" hidden>
 </header>
 <div id="pages"></div>
 <textarea id="ime" aria-label="Document text input" autocapitalize="off" autocomplete="off" spellcheck="false"></textarea>

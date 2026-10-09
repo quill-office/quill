@@ -6,7 +6,7 @@
 //! All coordinates are page-local: `x`/`y` include the page margin, and each
 //! line records the page it sits on.
 
-use quill_core::{Document, Format, Kind, Paragraph, Pos};
+use quill_core::{Document, Format, Image, Kind, Paragraph, Pos, OBJECT_CHAR};
 use serde::Serialize;
 
 pub const BASE_SIZE: f32 = 17.0;
@@ -68,6 +68,16 @@ fn style_for(kind: Kind, f: &Format) -> TextStyle {
     }
 }
 
+/// An inline image as placed on a line (display size after fitting).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct ImageBox {
+    pub id: u32,
+    /// Identifies the pixel data (for host-side caching).
+    pub uid: u64,
+    pub w: f32,
+    pub h: f32,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Item {
     /// Absolute page x.
@@ -79,6 +89,8 @@ pub struct Item {
     pub size: f32,
     /// Char offset of `text` within its paragraph.
     pub start: usize,
+    /// Set for an inline image; `text` is then a single object character.
+    pub image: Option<ImageBox>,
 }
 
 impl Item {
@@ -205,6 +217,7 @@ impl Pager {
 fn para_lines(
     pi: usize,
     para: &Paragraph,
+    images: &[Image],
     left: f32,
     width: f32,
     number: usize,
@@ -259,7 +272,34 @@ fn para_lines(
             underline: st.underline,
             size: st.size,
             start,
+            image: None,
         };
+        if let Some(id) = run.format.image {
+            // One inline image per object character.
+            for _ in run.text.chars() {
+                let (uid, mut w, mut h) = images.get(id as usize).map_or((0, size, size), |i| {
+                    (i.uid, i.width as f32, i.height as f32)
+                });
+                if w > avail {
+                    h *= avail / w;
+                    w = avail;
+                }
+                if x + w > avail && !cur.items.is_empty() {
+                    cur.end = offset;
+                    lines.push(std::mem::replace(&mut cur, new_line(offset, None)));
+                    x = 0.0;
+                }
+                let mut it = item(x, &OBJECT_CHAR.to_string(), offset);
+                it.image = Some(ImageBox { id, uid, w, h });
+                cur.items.push(it);
+                x += w;
+                offset += 1;
+                // The image sits on the baseline; the line grows to hold it.
+                cur.baseline = cur.baseline.max(h);
+                cur.height = cur.baseline + size * (LINE_FACTOR - 1.0);
+            }
+            continue;
+        }
         for tok in tokens(&run.text) {
             let n = tok.chars().count();
             let w = m.width(tok, &st);
@@ -331,7 +371,7 @@ pub fn layout(doc: &Document, setup: PageSetup, m: &dyn Measure) -> Layout {
             if matches!(para.kind, Kind::Heading(_)) && pager.y > 0.0 {
                 pager.y += para_size(para.kind) * 0.4;
             }
-            for line in para_lines(i, para, setup.margin, content_w, number, m) {
+            for line in para_lines(i, para, &doc.images, setup.margin, content_w, number, m) {
                 pager.push(line);
             }
             pager.y += PARA_SPACING;
@@ -375,7 +415,9 @@ pub fn layout(doc: &Document, setup: PageSetup, m: &dyn Measure) -> Layout {
                 for &pi in cell {
                     let p = &doc.paragraphs[pi];
                     n = if p.kind == Kind::Numbered { n + 1 } else { 0 };
-                    for mut line in para_lines(pi, p, left, col_w - 2.0 * CELL_PAD, n, m) {
+                    for mut line in
+                        para_lines(pi, p, &doc.images, left, col_w - 2.0 * CELL_PAD, n, m)
+                    {
                         line.y = y;
                         y += line.height;
                         lines.push(line);
@@ -412,6 +454,23 @@ pub fn layout(doc: &Document, setup: PageSetup, m: &dyn Measure) -> Layout {
         lines: pager.lines,
         cells: pager.cells,
         pages,
+    }
+}
+
+/// Width of the first `chars` characters of an item.
+fn prefix_width(it: &Item, chars: usize, m: &dyn Measure) -> f32 {
+    match &it.image {
+        Some(b) => {
+            if chars == 0 {
+                0.0
+            } else {
+                b.w
+            }
+        }
+        None => {
+            let prefix: String = it.text.chars().take(chars).collect();
+            m.width(&prefix, &it.style())
+        }
     }
 }
 
@@ -454,8 +513,7 @@ impl Layout {
                 break;
             }
             if offset <= it.start + n {
-                let prefix: String = it.text.chars().take(offset - it.start).collect();
-                x = it.x + m.width(&prefix, &it.style());
+                x = it.x + prefix_width(it, offset - it.start, m);
                 if offset < it.start + n {
                     break;
                 }
@@ -482,12 +540,9 @@ impl Layout {
             if x < it.x {
                 break;
             }
-            let st = it.style();
-            let chars: Vec<char> = it.text.chars().collect();
             let mut prev = 0.0;
-            for k in 1..=chars.len() {
-                let s: String = chars[..k].iter().collect();
-                let w = m.width(&s, &st);
+            for k in 1..=it.len() {
+                let w = prefix_width(it, k, m);
                 if x >= it.x + (prev + w) / 2.0 {
                     off = it.start + k;
                 }
@@ -937,5 +992,79 @@ mod tests {
             .filter_map(|l| l.marker.as_ref().map(|m| m.text.as_str()))
             .collect();
         assert_eq!(marks, ["1.", "1."]);
+    }
+
+    fn image_doc(w: u32, h: u32) -> Document {
+        let mut d = Document::from_paragraphs(vec![Paragraph::plain("ab cd")]);
+        d.insert_image(
+            Pos { para: 0, offset: 2 },
+            Image::new("image/png", vec![1], w, h),
+        );
+        d
+    }
+
+    #[test]
+    fn inline_image_grows_line_and_sits_on_baseline() {
+        let d = image_doc(50, 100);
+        let l = layout(&d, SETUP, &m);
+        let line = &l.lines[0];
+        let img = line.items.iter().find(|i| i.image.is_some()).unwrap();
+        assert_eq!(img.image.unwrap().h, 100.0);
+        assert_eq!(line.baseline, 100.0, "baseline lowered to the image bottom");
+        assert!(
+            line.height > 100.0 && line.height < 100.0 + BASE_SIZE,
+            "line = image + descent"
+        );
+        // Text after the image continues on the same line (offset 3 = after the image).
+        let after = line.items.iter().find(|i| i.start == 3).unwrap();
+        assert_eq!(after.x, img.x + 50.0);
+    }
+
+    #[test]
+    fn oversized_image_is_scaled_to_the_line_width() {
+        let d = image_doc(400, 200);
+        let l = layout(&d, SETUP, &m); // 100px wide text area
+        let img = l
+            .lines
+            .iter()
+            .flat_map(|l| &l.items)
+            .find_map(|i| i.image)
+            .unwrap();
+        assert_eq!((img.w, img.h), (100.0, 50.0));
+    }
+
+    #[test]
+    fn image_wraps_like_a_word() {
+        let d = image_doc(60, 20); // "ab" (20px) + image (60) fits; then " cd" would not on same line
+        let l = layout(&d, SETUP, &m);
+        assert!(l.lines.len() >= 2);
+        assert!(l
+            .lines
+            .iter()
+            .flat_map(|l| &l.items)
+            .any(|i| i.image.is_some()));
+    }
+
+    #[test]
+    fn caret_and_hit_test_around_an_image() {
+        let d = image_doc(30, 20);
+        let l = layout(&d, SETUP, &m);
+        let before = l.caret(Pos { para: 0, offset: 2 }, &m);
+        let after = l.caret(Pos { para: 0, offset: 3 }, &m);
+        assert_eq!(after.x - before.x, 30.0);
+        let y = before.y + 5.0;
+        assert_eq!(
+            l.hit_test(0, before.x + 5.0, y, &m).offset,
+            2,
+            "left half → before"
+        );
+        assert_eq!(
+            l.hit_test(0, before.x + 25.0, y, &m).offset,
+            3,
+            "right half → after"
+        );
+        let r = l.selection_rects(Pos { para: 0, offset: 2 }, Pos { para: 0, offset: 3 }, &m);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].w, 30.0);
     }
 }
