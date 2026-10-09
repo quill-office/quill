@@ -49,6 +49,15 @@
   <span class="sep"></span>
   <button id="bullet" data-kind="bullet" title="Bulleted list" aria-label="Bulleted list">• List</button>
   <button id="numbered" data-kind="numbered" title="Numbered list" aria-label="Numbered list">1. List</button>
+  <span class="sep"></span>
+  <button id="table" title="Insert a 3×3 table">▦ Table</button>
+  <span id="tableTools" hidden>
+    <button data-table="add_row" title="Add row below">+Row</button>
+    <button data-table="add_col" title="Add column right">+Col</button>
+    <button data-table="delete_row" title="Delete row">−Row</button>
+    <button data-table="delete_col" title="Delete column">−Col</button>
+    <button data-table="delete_table" title="Delete table">✕ Table</button>
+  </span>
   <span id="status">loading…</span>
   <input id="file" type="file" accept=".docx" hidden>
 </header>

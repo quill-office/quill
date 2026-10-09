@@ -37,6 +37,7 @@ struct State {
     can_undo: bool,
     can_redo: bool,
     has_selection: bool,
+    in_table: bool,
 }
 
 #[derive(Serialize)]
@@ -216,6 +217,33 @@ impl Editor {
         Ok(())
     }
 
+    /// Insert a `rows` × `cols` table at the caret (no-op inside a table).
+    pub fn insert_table(&mut self, rows: usize, cols: usize) {
+        self.goal_x = None;
+        self.inner.insert_table(rows, cols);
+    }
+
+    /// `op` is "add_row", "add_col", "delete_row", "delete_col" or "delete_table";
+    /// it acts on the table containing the caret.
+    pub fn table_op(&mut self, op: &str) -> Result<(), JsError> {
+        self.goal_x = None;
+        match op {
+            "add_row" => self.inner.add_row(),
+            "add_col" => self.inner.add_col(),
+            "delete_row" => self.inner.delete_row(),
+            "delete_col" => self.inner.delete_col(),
+            "delete_table" => self.inner.delete_table(),
+            other => return Err(JsError::new(&format!("unknown table operation: {other}"))),
+        }
+        Ok(())
+    }
+
+    /// Next/previous table cell; types a tab character outside tables.
+    pub fn tab(&mut self, backwards: bool) {
+        self.goal_x = None;
+        self.inner.tab(backwards);
+    }
+
     // ---- cursor ----------------------------------------------------------
 
     /// Place or extend the caret at a page-local point. `clicks` of 2 selects a
@@ -312,6 +340,7 @@ impl Editor {
                 can_undo: self.inner.can_undo(),
                 can_redo: self.inner.can_redo(),
                 has_selection: self.inner.has_selection(),
+                in_table: self.inner.in_table(),
             },
             layout: &l,
         };

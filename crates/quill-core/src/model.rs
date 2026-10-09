@@ -72,10 +72,32 @@ impl Run {
     }
 }
 
+/// A table as rows → columns → the paragraphs of each cell.
+type Grid = Vec<Vec<Vec<Paragraph>>>;
+
+/// Which table cell a paragraph lives in. A table is a run of consecutive
+/// paragraphs sharing `table`, stored in row-major order; a cell may hold
+/// several paragraphs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cell {
+    pub table: u32,
+    pub row: u16,
+    pub col: u16,
+}
+
+impl Cell {
+    /// True if both cells are the same cell of the same table.
+    fn same_cell(a: Option<Cell>, b: Option<Cell>) -> bool {
+        a == b
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Paragraph {
     pub kind: Kind,
     pub runs: Vec<Run>,
+    #[serde(default)]
+    pub cell: Option<Cell>,
 }
 
 impl Paragraph {
@@ -119,11 +141,12 @@ impl Paragraph {
         last.cloned().unwrap_or_default()
     }
 
-    /// Split into (before, after) at `offset`; both keep this paragraph's kind.
+    /// Split into (before, after) at `offset`; both keep this paragraph's kind and cell.
     fn split_at(&self, offset: usize) -> (Paragraph, Paragraph) {
         let mk = || Paragraph {
             kind: self.kind,
             runs: vec![],
+            cell: self.cell,
         };
         let (mut a, mut b) = (mk(), mk());
         let mut pos = 0;
@@ -199,11 +222,12 @@ fn class(c: char) -> CharClass {
 
 impl Document {
     pub fn from_paragraphs(mut paragraphs: Vec<Paragraph>) -> Self {
-        if paragraphs.is_empty() {
-            paragraphs.push(Paragraph::default());
-        }
         for p in &mut paragraphs {
             p.normalize();
+        }
+        let mut paragraphs = repair_tables(paragraphs);
+        if paragraphs.is_empty() {
+            paragraphs.push(Paragraph::default());
         }
         Self { paragraphs }
     }
@@ -283,22 +307,59 @@ impl Document {
     }
 
     /// Delete `[start, end)`; the merged paragraph keeps `start`'s kind.
+    ///
+    /// Table structure is never destroyed by a text deletion: paragraphs that
+    /// belong to table cells are emptied rather than removed, and paragraphs
+    /// are only merged when nothing structural lies between them.
     pub fn delete_range(&mut self, start: Pos, end: Pos) -> Pos {
         let (start, end) = (self.clamp(start), self.clamp(end));
         if start >= end {
             return start;
         }
-        let (mut a, _) = self.paragraphs[start.para].split_at(start.offset);
-        let (_, c) = self.paragraphs[end.para].split_at(end.offset);
-        a.runs.extend(c.runs);
-        a.normalize();
-        self.paragraphs.splice(start.para..=end.para, [a]);
+        if start.para == end.para {
+            let p = &mut self.paragraphs[start.para];
+            let (mut a, b) = p.split_at(start.offset);
+            let (_, c) = b.split_at(end.offset - start.offset);
+            a.runs.extend(c.runs);
+            a.normalize();
+            *p = a;
+            return start;
+        }
+        let (mut head, _) = self.paragraphs[start.para].split_at(start.offset);
+        let (_, tail) = self.paragraphs[end.para].split_at(end.offset);
+        head.normalize();
+        let mut tail = tail;
+        tail.normalize();
+        // Interior paragraphs: drop plain ones, empty table ones.
+        let mut keep: Vec<Paragraph> = Vec::new();
+        for i in start.para + 1..end.para {
+            let p = &self.paragraphs[i];
+            if p.cell.is_some() {
+                keep.push(Paragraph {
+                    kind: Kind::Normal,
+                    runs: vec![],
+                    cell: p.cell,
+                });
+            }
+        }
+        let adjacent = keep.is_empty();
+        let mut replacement = Vec::with_capacity(keep.len() + 2);
+        if adjacent && Cell::same_cell(head.cell, tail.cell) {
+            head.runs.extend(tail.runs);
+            head.normalize();
+            replacement.push(head);
+        } else {
+            replacement.push(head);
+            replacement.extend(keep);
+            replacement.push(tail);
+        }
+        self.paragraphs.splice(start.para..=end.para, replacement);
         start
     }
 
     /// Delete the char before `pos`. At the start of a heading/list item this
     /// first demotes it to a normal paragraph; at the start of a normal one it
-    /// joins with the previous paragraph.
+    /// joins with the previous paragraph (unless that crosses a table edge).
     pub fn backspace(&mut self, pos: Pos) -> Pos {
         let pos = self.clamp(pos);
         if pos.offset > 0 {
@@ -315,7 +376,12 @@ impl Document {
             p.kind = Kind::Normal;
             return pos;
         }
-        if pos.para == 0 {
+        if pos.para == 0
+            || !Cell::same_cell(
+                self.paragraphs[pos.para - 1].cell,
+                self.paragraphs[pos.para].cell,
+            )
+        {
             return pos;
         }
         let prev_end = Pos {
@@ -332,7 +398,12 @@ impl Document {
                 para: pos.para,
                 offset: pos.offset + 1,
             }
-        } else if pos.para + 1 < self.paragraphs.len() {
+        } else if pos.para + 1 < self.paragraphs.len()
+            && Cell::same_cell(
+                self.paragraphs[pos.para].cell,
+                self.paragraphs[pos.para + 1].cell,
+            )
+        {
             Pos {
                 para: pos.para + 1,
                 offset: 0,
@@ -341,6 +412,186 @@ impl Document {
             return pos;
         };
         self.delete_range(pos, next)
+    }
+
+    // ---- tables ----------------------------------------------------------
+
+    pub fn cell_at(&self, para: usize) -> Option<Cell> {
+        self.paragraphs.get(para).and_then(|p| p.cell)
+    }
+
+    /// First position of the given cell, if it exists.
+    pub fn cell_start(&self, table: u32, row: u16, col: u16) -> Option<Pos> {
+        let want = Cell { table, row, col };
+        self.paragraphs
+            .iter()
+            .position(|p| p.cell == Some(want))
+            .map(|para| Pos { para, offset: 0 })
+    }
+
+    /// Number of (rows, cols) of a table.
+    pub fn table_dims(&self, table: u32) -> Option<(usize, usize)> {
+        let cells: Vec<Cell> = self
+            .paragraphs
+            .iter()
+            .filter_map(|p| p.cell)
+            .filter(|c| c.table == table)
+            .collect();
+        let rows = cells.iter().map(|c| c.row as usize + 1).max()?;
+        let cols = cells.iter().map(|c| c.col as usize + 1).max()?;
+        Some((rows, cols))
+    }
+
+    /// Insert an empty `rows` × `cols` table at `pos` (splitting the
+    /// paragraph there). Returns the start of the first cell, or `None` when
+    /// `pos` is already inside a table (no nesting) or the size is zero.
+    pub fn insert_table(&mut self, pos: Pos, rows: usize, cols: usize) -> Option<Pos> {
+        let pos = self.clamp(pos);
+        if rows == 0
+            || cols == 0
+            || rows > u16::MAX as usize
+            || cols > u16::MAX as usize
+            || self.paragraphs[pos.para].cell.is_some()
+        {
+            return None;
+        }
+        let after = self.split_paragraph(pos);
+        if self.paragraphs[after.para].is_empty() {
+            self.paragraphs[after.para].kind = Kind::Normal;
+        }
+        let id = self
+            .paragraphs
+            .iter()
+            .filter_map(|p| p.cell)
+            .map(|c| c.table)
+            .max()
+            .map_or(0, |m| m + 1);
+        let mut cells = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                cells.push(Paragraph {
+                    cell: Some(Cell {
+                        table: id,
+                        row: r as u16,
+                        col: c as u16,
+                    }),
+                    ..Default::default()
+                });
+            }
+        }
+        self.paragraphs.splice(after.para..after.para, cells);
+        Some(Pos {
+            para: after.para,
+            offset: 0,
+        })
+    }
+
+    /// Extract a table as rows → cols → paragraphs, with its index range.
+    fn take_grid(&self, table: u32) -> Option<(usize, usize, Grid)> {
+        let first = self
+            .paragraphs
+            .iter()
+            .position(|p| p.cell.is_some_and(|c| c.table == table))?;
+        let last = self
+            .paragraphs
+            .iter()
+            .rposition(|p| p.cell.is_some_and(|c| c.table == table))?;
+        let (rows, cols) = self.table_dims(table)?;
+        let mut grid = vec![vec![Vec::new(); cols]; rows];
+        for p in &self.paragraphs[first..=last] {
+            let c = p.cell?;
+            grid[c.row as usize][c.col as usize].push(p.clone());
+        }
+        Some((first, last, grid))
+    }
+
+    fn put_grid(&mut self, table: u32, first: usize, last: usize, grid: Grid) {
+        let mut flat = Vec::new();
+        for (r, row) in grid.into_iter().enumerate() {
+            for (c, mut cell) in row.into_iter().enumerate() {
+                if cell.is_empty() {
+                    cell.push(Paragraph::default());
+                }
+                for mut p in cell {
+                    p.cell = Some(Cell {
+                        table,
+                        row: r as u16,
+                        col: c as u16,
+                    });
+                    flat.push(p);
+                }
+            }
+        }
+        self.paragraphs.splice(first..=last, flat);
+    }
+
+    /// Run `f` on the grid of the table containing `para`; returns where the
+    /// caret should go afterwards (a cell start, or the paragraph where the
+    /// table was removed).
+    fn edit_table(
+        &mut self,
+        para: usize,
+        f: impl FnOnce(&mut Grid, Cell) -> (u16, u16),
+    ) -> Option<Pos> {
+        let cell = self.cell_at(para)?;
+        let (first, last, mut grid) = self.take_grid(cell.table)?;
+        let (row, col) = f(&mut grid, cell);
+        if grid.is_empty() || grid[0].is_empty() {
+            self.paragraphs.splice(first..=last, std::iter::empty());
+            if self.paragraphs.is_empty() {
+                self.paragraphs.push(Paragraph::default());
+            }
+            return Some(Pos {
+                para: first.min(self.paragraphs.len() - 1),
+                offset: 0,
+            });
+        }
+        self.put_grid(cell.table, first, last, grid);
+        self.cell_start(cell.table, row, col)
+    }
+
+    /// Insert an empty row below the row containing `para`.
+    pub fn add_row(&mut self, para: usize) -> Option<Pos> {
+        self.edit_table(para, |g, c| {
+            let cols = g[0].len();
+            g.insert(c.row as usize + 1, vec![Vec::new(); cols]);
+            (c.row + 1, c.col)
+        })
+    }
+
+    /// Insert an empty column right of the column containing `para`.
+    pub fn add_col(&mut self, para: usize) -> Option<Pos> {
+        self.edit_table(para, |g, c| {
+            for row in g.iter_mut() {
+                row.insert(c.col as usize + 1, Vec::new());
+            }
+            (c.row, c.col + 1)
+        })
+    }
+
+    /// Remove the row containing `para` (the whole table if it is the last row).
+    pub fn delete_row(&mut self, para: usize) -> Option<Pos> {
+        self.edit_table(para, |g, c| {
+            g.remove(c.row as usize);
+            (c.row.min(g.len().saturating_sub(1) as u16), c.col)
+        })
+    }
+
+    /// Remove the column containing `para` (the whole table if it is the last column).
+    pub fn delete_col(&mut self, para: usize) -> Option<Pos> {
+        self.edit_table(para, |g, c| {
+            for row in g.iter_mut() {
+                row.remove(c.col as usize);
+            }
+            (c.row, c.col.min(g[0].len().saturating_sub(1) as u16))
+        })
+    }
+
+    pub fn delete_table(&mut self, para: usize) -> Option<Pos> {
+        self.edit_table(para, |g, _| {
+            g.clear();
+            (0, 0)
+        })
     }
 
     pub fn text_in_range(&self, start: Pos, end: Pos) -> String {
@@ -485,4 +736,52 @@ impl Document {
             pos
         }
     }
+}
+
+/// Make table paragraphs well-formed: contiguous rows × cols grids in
+/// row-major order, no gaps, and a non-table paragraph after every table.
+fn repair_tables(paras: Vec<Paragraph>) -> Vec<Paragraph> {
+    use std::collections::BTreeMap;
+    let mut out = Vec::with_capacity(paras.len());
+    let mut i = 0;
+    while i < paras.len() {
+        let Some(first) = paras[i].cell else {
+            out.push(paras[i].clone());
+            i += 1;
+            continue;
+        };
+        let mut j = i;
+        while j < paras.len() && paras[j].cell.is_some_and(|c| c.table == first.table) {
+            j += 1;
+        }
+        let mut cells: BTreeMap<(u16, u16), Vec<Paragraph>> = BTreeMap::new();
+        for p in &paras[i..j] {
+            let c = p.cell.expect("checked above");
+            cells.entry((c.row, c.col)).or_default().push(p.clone());
+        }
+        let mut rows: Vec<u16> = cells.keys().map(|k| k.0).collect();
+        rows.dedup();
+        let cols = cells.keys().map(|k| k.1 as usize + 1).max().unwrap_or(1);
+        for (ri, row) in rows.iter().enumerate() {
+            for col in 0..cols {
+                let mut cell = cells.remove(&(*row, col as u16)).unwrap_or_default();
+                if cell.is_empty() {
+                    cell.push(Paragraph::default());
+                }
+                for mut p in cell {
+                    p.cell = Some(Cell {
+                        table: first.table,
+                        row: ri as u16,
+                        col: col as u16,
+                    });
+                    out.push(p);
+                }
+            }
+        }
+        if j >= paras.len() || paras[j].cell.is_some() {
+            out.push(Paragraph::default());
+        }
+        i = j;
+    }
+    out
 }

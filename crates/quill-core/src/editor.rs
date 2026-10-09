@@ -302,6 +302,95 @@ impl Editor {
         });
     }
 
+    // ---- tables ----------------------------------------------------------
+
+    pub fn in_table(&self) -> bool {
+        self.doc.cell_at(self.head.para).is_some()
+    }
+
+    /// Insert a `rows` × `cols` table at the caret (clamped to 1..=50 × 1..=20).
+    /// Does nothing inside an existing table.
+    pub fn insert_table(&mut self, rows: usize, cols: usize) {
+        let (rows, cols) = (rows.clamp(1, 50), cols.clamp(1, 20));
+        self.edit(Action::Other, |e| {
+            e.delete_selection();
+            if let Some(p) = e.doc.insert_table(e.head, rows, cols) {
+                e.head = p;
+                e.anchor = p;
+                e.pending = None;
+            }
+        });
+    }
+
+    /// Apply a structural table edit at the caret; `f` returns the new caret.
+    fn table_edit(&mut self, f: impl FnOnce(&mut Document, usize) -> Option<Pos>) {
+        if !self.in_table() {
+            return;
+        }
+        self.edit(Action::Other, |e| {
+            if let Some(p) = f(&mut e.doc, e.head.para) {
+                e.head = p;
+                e.anchor = p;
+                e.pending = None;
+            }
+        });
+    }
+
+    pub fn add_row(&mut self) {
+        self.table_edit(|d, p| d.add_row(p));
+    }
+
+    pub fn add_col(&mut self) {
+        self.table_edit(|d, p| d.add_col(p));
+    }
+
+    pub fn delete_row(&mut self) {
+        self.table_edit(|d, p| d.delete_row(p));
+    }
+
+    pub fn delete_col(&mut self) {
+        self.table_edit(|d, p| d.delete_col(p));
+    }
+
+    pub fn delete_table(&mut self) {
+        self.table_edit(|d, p| d.delete_table(p));
+    }
+
+    /// Tab: in a table, move to the next cell (adding a row after the last
+    /// one); Shift+Tab moves back. Outside a table, Tab types a tab character.
+    pub fn tab(&mut self, backwards: bool) {
+        let Some(c) = self.doc.cell_at(self.head.para) else {
+            if !backwards {
+                self.insert_text("\t");
+            }
+            return;
+        };
+        let (rows, cols) = self.doc.table_dims(c.table).unwrap_or((1, 1));
+        let (r, k) = (c.row as usize, c.col as usize);
+        let target = if backwards {
+            match (r, k) {
+                (0, 0) => None,
+                (_, 0) => Some((r - 1, cols - 1)),
+                _ => Some((r, k - 1)),
+            }
+        } else if k + 1 < cols {
+            Some((r, k + 1))
+        } else if r + 1 < rows {
+            Some((r + 1, 0))
+        } else {
+            self.add_row();
+            if let Some(p) = self.doc.cell_start(c.table, c.row + 1, 0) {
+                self.set_cursor(p, false);
+            }
+            return;
+        };
+        if let Some((r, k)) = target {
+            if let Some(p) = self.doc.cell_start(c.table, r as u16, k as u16) {
+                self.set_cursor(p, false);
+            }
+        }
+    }
+
     // ---- state for the UI ------------------------------------------------
 
     /// Format at the caret (or the pending format), for toolbar state.
@@ -494,5 +583,207 @@ mod tests {
             d.text_in_range(Pos { para: 0, offset: 1 }, Pos { para: 1, offset: 1 }),
             "b\nc"
         );
+    }
+
+    fn cells(e: &Editor) -> Vec<(u16, u16, String)> {
+        e.doc()
+            .paragraphs
+            .iter()
+            .filter_map(|p| p.cell.map(|c| (c.row, c.col, p.text())))
+            .collect()
+    }
+
+    #[test]
+    fn insert_table_splits_paragraph_and_leaves_trailing_paragraph() {
+        let mut e = ed("ab");
+        e.set_cursor(Pos { para: 0, offset: 1 }, false);
+        e.insert_table(2, 3);
+        let d = e.doc();
+        assert_eq!(d.paragraphs.len(), 1 + 6 + 1);
+        assert_eq!(d.paragraphs[0].text(), "a");
+        assert_eq!(d.paragraphs[7].text(), "b");
+        assert_eq!(e.head(), Pos { para: 1, offset: 0 });
+        assert!(e.in_table());
+        e.undo();
+        assert_eq!(e.doc().plain_text(), "ab");
+    }
+
+    #[test]
+    fn no_nested_tables() {
+        let mut e = ed("x");
+        e.insert_table(2, 2);
+        let n = e.doc().paragraphs.len();
+        e.insert_table(2, 2);
+        assert_eq!(e.doc().paragraphs.len(), n);
+    }
+
+    #[test]
+    fn tab_walks_cells_and_appends_a_row() {
+        let mut e = ed("x");
+        e.insert_table(1, 2);
+        e.insert_text("A");
+        e.tab(false);
+        e.insert_text("B");
+        e.tab(false); // last cell → new row
+        e.insert_text("C");
+        assert_eq!(
+            cells(&e),
+            vec![
+                (0, 0, "A".into()),
+                (0, 1, "B".into()),
+                (1, 0, "C".into()),
+                (1, 1, "".into())
+            ]
+        );
+        e.tab(true);
+        assert_eq!(
+            e.doc().cell_at(e.head().para).map(|c| (c.row, c.col)),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn tab_outside_table_types_a_tab() {
+        let mut e = ed("a");
+        e.tab(false);
+        assert_eq!(e.doc().plain_text(), "a\t");
+        e.tab(true);
+        assert_eq!(e.doc().plain_text(), "a\t");
+    }
+
+    #[test]
+    fn backspace_never_crosses_cell_boundaries() {
+        let mut e = ed("x");
+        e.insert_table(1, 2);
+        e.tab(false);
+        let before = e.doc().clone();
+        e.backspace(); // at the start of cell (0,1)
+        assert_eq!(e.doc(), &before);
+        e.set_cursor(Pos { para: 1, offset: 0 }, false);
+        e.backspace(); // at the start of the first cell, after plain "x"? "x" is before the table
+        assert_eq!(e.doc(), &before);
+    }
+
+    #[test]
+    fn delete_forward_stops_at_cell_end() {
+        let mut e = ed("x");
+        e.insert_table(1, 2);
+        e.insert_text("A");
+        let before = e.doc().clone();
+        e.delete_forward();
+        assert_eq!(e.doc(), &before);
+    }
+
+    #[test]
+    fn selection_delete_across_cells_keeps_structure() {
+        let mut e = ed("top");
+        e.insert_table(2, 2);
+        for (i, t) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            e.insert_text(t);
+            if i < 3 {
+                e.tab(false);
+            }
+        }
+        // select from inside cell (0,0) to inside cell (1,1) and delete
+        let first = e.doc().cell_start(0, 0, 0).unwrap();
+        let last = e.doc().cell_start(0, 1, 1).unwrap();
+        e.set_cursor(first, false);
+        e.set_cursor(
+            Pos {
+                para: last.para,
+                offset: 1,
+            },
+            true,
+        );
+        e.backspace();
+        let c = cells(&e);
+        assert_eq!(c.len(), 4, "grid intact: {c:?}");
+        assert!(c.iter().all(|(_, _, t)| t.is_empty()));
+    }
+
+    #[test]
+    fn selection_spanning_text_and_table_deletes_text_only() {
+        let mut e = ed("hello");
+        e.insert_table(1, 1);
+        e.insert_text("cell");
+        e.set_cursor(Pos { para: 0, offset: 2 }, false);
+        e.set_cursor(Pos { para: 1, offset: 2 }, true);
+        e.backspace();
+        assert_eq!(e.doc().paragraphs[0].text(), "he");
+        assert_eq!(e.doc().paragraphs[1].text(), "ll");
+        assert!(e.doc().paragraphs[1].cell.is_some());
+    }
+
+    #[test]
+    fn add_and_delete_rows_and_cols() {
+        let mut e = ed("x");
+        e.insert_table(2, 2);
+        let t = e.doc().cell_at(e.head().para).unwrap().table;
+        e.add_col();
+        assert_eq!(e.doc().table_dims(t), Some((2, 3)));
+        assert_eq!(
+            e.doc().cell_at(e.head().para).map(|c| (c.row, c.col)),
+            Some((0, 1))
+        );
+        e.add_row();
+        assert_eq!(e.doc().table_dims(t), Some((3, 3)));
+        e.delete_row();
+        e.delete_col();
+        assert_eq!(e.doc().table_dims(t), Some((2, 2)));
+        e.undo();
+        assert_eq!(e.doc().table_dims(t), Some((2, 3)));
+    }
+
+    #[test]
+    fn deleting_last_row_removes_table() {
+        let mut e = ed("x");
+        e.insert_table(1, 2);
+        e.delete_row();
+        assert!(e.doc().paragraphs.iter().all(|p| p.cell.is_none()));
+        assert!(!e.in_table());
+    }
+
+    #[test]
+    fn delete_table_removes_all_cells() {
+        let mut e = ed("x");
+        e.insert_table(3, 3);
+        e.delete_table();
+        assert_eq!(e.doc().plain_text(), "x\n");
+    }
+
+    #[test]
+    fn enter_inside_cell_stays_in_cell() {
+        let mut e = ed("x");
+        e.insert_table(1, 1);
+        e.insert_text("ab");
+        e.enter();
+        e.insert_text("cd");
+        let c = cells(&e);
+        assert_eq!(c, vec![(0, 0, "ab".into()), (0, 0, "cd".into())]);
+    }
+
+    #[test]
+    fn repair_fills_ragged_and_adjacent_tables() {
+        let cell = |t, r, c, s: &str| Paragraph {
+            cell: Some(Cell {
+                table: t,
+                row: r,
+                col: c,
+            }),
+            ..Paragraph::plain(s)
+        };
+        let d = Document::from_paragraphs(vec![
+            cell(0, 0, 0, "a"),
+            cell(0, 0, 1, "b"),
+            cell(0, 1, 0, "c"),
+            cell(1, 0, 0, "z"),
+        ]);
+        assert_eq!(d.table_dims(0), Some((2, 2)));
+        assert_eq!(
+            d.paragraphs.iter().filter(|p| p.cell.is_none()).count(),
+            2,
+            "separator between tables and a trailing paragraph"
+        );
+        assert!(d.paragraphs.last().unwrap().cell.is_none());
     }
 }

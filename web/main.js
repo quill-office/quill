@@ -28,6 +28,7 @@ Quill is an open-source office suite written in Rust and compiled to WebAssembly
 - Selection with mouse, Shift+arrows, double-click for a word, triple-click for a paragraph
 - Undo and redo, cut, copy and paste
 - Bold, italic and underline; headings; bulleted and numbered lists
+- Tables: use the Table button, then Tab to move between cells
 - Pages, wrapping, and opening or saving .docx files
 ## Try it
 1. Press Ctrl+Z after typing to undo a burst of typing at once
@@ -59,6 +60,9 @@ function paint() {
     const ctx = canvas.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, PAGE.w, PAGE.h);
+    ctx.strokeStyle = "#9aa0a6";
+    ctx.lineWidth = 1;
+    for (const c of frame.layout.cells) if (c.page === p) ctx.strokeRect(c.x + 0.5, c.y + 0.5, c.w, c.h);
     ctx.fillStyle = SELECTION_COLOR;
     for (const r of frame.selection) if (r.page === p) ctx.fillRect(r.x, r.y, r.w, r.h);
     ctx.fillStyle = TEXT_COLOR;
@@ -97,6 +101,8 @@ function updateToolbar() {
   for (const b of document.querySelectorAll("[data-kind]")) b.setAttribute("aria-pressed", String(s.kind === b.dataset.kind));
   const sel = $("kind");
   sel.value = ["normal", "h1", "h2", "h3"].includes(s.kind) ? s.kind : "normal";
+  $("tableTools").hidden = !s.in_table;
+  $("table").disabled = s.in_table;
   $("undo").disabled = !s.can_undo;
   $("redo").disabled = !s.can_redo;
   const words = editor.text().split(/\s+/).filter(Boolean).length;
@@ -200,7 +206,7 @@ ime.addEventListener("keydown", (e) => {
   } else {
     switch (e.key) {
       case "Enter": editor.enter(); break;
-      case "Tab": editor.insert_text("\t"); break;
+      case "Tab": editor.tab(e.shiftKey); break;
       case "Backspace": editor.backspace(); break;
       case "Delete": editor.delete_forward(); break;
       case "ArrowLeft": editor.move_left(e.shiftKey); break;
@@ -247,6 +253,8 @@ $("undo").onclick = act(() => editor.undo());
 $("redo").onclick = act(() => editor.redo());
 for (const b of document.querySelectorAll("[data-attr]")) b.onclick = act(() => editor.toggle_attr(b.dataset.attr));
 for (const b of document.querySelectorAll("[data-kind]")) b.onclick = act(() => editor.toggle_kind(b.dataset.kind));
+$("table").onclick = act(() => editor.insert_table(3, 3));
+for (const b of document.querySelectorAll("[data-table]")) b.onclick = act(() => editor.table_op(b.dataset.table));
 $("kind").onchange = act(() => editor.toggle_kind($("kind").value));
 
 const file = $("file");

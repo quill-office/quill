@@ -9,7 +9,7 @@ use std::io::{Cursor, Read, Write};
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
-use quill_core::{Document, Format, Kind, Paragraph, Run};
+use quill_core::{Cell, Document, Format, Kind, Paragraph, Run};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocxError {
@@ -133,6 +133,10 @@ fn parse_document_xml(xml: &str, numbering: &HashMap<u32, bool>) -> Result<Docum
     let mut num_kind: Option<Kind> = None;
     let mut fmt = Format::default();
     let mut in_text = false;
+    // Table state. Only the outermost table is modelled; paragraphs of nested
+    // tables are folded into the enclosing cell.
+    let (mut depth, mut tables, mut row, mut col) = (0u32, 0u32, -1i32, -1i32);
+    let mut cell: Option<Cell> = None;
     loop {
         match r.read_event()? {
             Event::Start(e) if e.local_name().as_ref() == "p" => {
@@ -140,8 +144,30 @@ fn parse_document_xml(xml: &str, numbering: &HashMap<u32, bool>) -> Result<Docum
                 style_kind = None;
                 num_kind = None;
             }
-            Event::Empty(e) if e.local_name().as_ref() == "p" => paras.push(Paragraph::default()),
+            Event::Empty(e) if e.local_name().as_ref() == "p" => paras.push(Paragraph {
+                cell,
+                ..Default::default()
+            }),
             Event::Start(e) => match e.local_name().as_ref() {
+                "tbl" => {
+                    depth += 1;
+                    if depth == 1 {
+                        tables += 1;
+                        row = -1;
+                    }
+                }
+                "tr" if depth == 1 => {
+                    row += 1;
+                    col = -1;
+                }
+                "tc" if depth == 1 => {
+                    col += 1;
+                    cell = Some(Cell {
+                        table: tables - 1,
+                        row: row.max(0) as u16,
+                        col: col.max(0) as u16,
+                    });
+                }
                 "r" => fmt = Format::default(),
                 "b" => fmt.bold = toggle_on(&e),
                 "i" => fmt.italic = toggle_on(&e),
@@ -179,8 +205,16 @@ fn parse_document_xml(xml: &str, numbering: &HashMap<u32, bool>) -> Result<Docum
             }
             Event::End(e) => match e.local_name().as_ref() {
                 "t" => in_text = false,
+                "tc" if depth == 1 => cell = None,
+                "tbl" => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        cell = None;
+                    }
+                }
                 "p" => {
                     if let Some(mut p) = cur.take() {
+                        p.cell = cell;
                         // A list numbering wins over a plain style.
                         p.kind = num_kind.or(style_kind).unwrap_or(Kind::Normal);
                         paras.push(p);
@@ -271,7 +305,50 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
     let mut body = String::new();
     let mut numbered_lists = 0u32;
     let mut prev_numbered = false;
+    let mut prev_cell: Option<Cell> = None;
+    let mut open_table: Option<(u32, u16, u16)> = None; // (table, row, col) currently open
+    let ncols_of = |t: u32| doc.table_dims(t).map_or(1, |d| d.1);
+
     for p in &doc.paragraphs {
+        // Close cells/rows/tables as the paragraph's cell changes.
+        let next = p.cell.map(|c| (c.table, c.row, c.col));
+        if open_table != next {
+            if let Some((t, r, c)) = open_table {
+                match next {
+                    Some((nt, nr, nc)) if nt == t && nr == r && nc != c => body.push_str("</w:tc>"),
+                    Some((nt, nr, _)) if nt == t && nr != r => body.push_str("</w:tc></w:tr>"),
+                    _ => body.push_str("</w:tc></w:tr></w:tbl>"),
+                }
+            }
+            if let Some((t, r, c)) = next {
+                let same_table = open_table.is_some_and(|o| o.0 == t);
+                let new_row = !same_table || open_table.is_some_and(|o| o.1 != r);
+                if !same_table {
+                    let n = ncols_of(t);
+                    body.push_str(
+                        "<w:tbl><w:tblPr><w:tblW w:w=\"5000\" w:type=\"pct\"/><w:tblBorders>",
+                    );
+                    for side in ["top", "left", "bottom", "right", "insideH", "insideV"] {
+                        body.push_str(&format!("<w:{side} w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"808080\"/>"));
+                    }
+                    body.push_str("</w:tblBorders></w:tblPr><w:tblGrid>");
+                    for _ in 0..n {
+                        body.push_str(&format!("<w:gridCol w:w=\"{}\"/>", 9000 / n));
+                    }
+                    body.push_str("</w:tblGrid>");
+                }
+                if new_row {
+                    body.push_str("<w:tr>");
+                }
+                let _ = c;
+                body.push_str("<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/></w:tcPr>");
+            }
+            open_table = next;
+        }
+        if p.cell != prev_cell {
+            prev_numbered = false;
+            prev_cell = p.cell;
+        }
         let ppr = match p.kind {
             Kind::Normal => String::new(),
             Kind::Heading(n) => format!("<w:pPr><w:pStyle w:val=\"Heading{n}\"/></w:pPr>"),
@@ -290,6 +367,9 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
             body.push_str(&run_xml(&r.text, &r.format));
         }
         body.push_str("</w:p>");
+    }
+    if open_table.is_some() {
+        body.push_str("</w:tc></w:tr></w:tbl><w:p/>"); // Word requires a paragraph after a table
     }
     let document =
         format!("{XML_DECL}<w:document xmlns:w=\"{NS_W}\"><w:body>{body}</w:body></w:document>");
@@ -428,5 +508,74 @@ mod tests {
         let xml = r#"<w:document xmlns:w="x"><w:body><w:p/><w:p><w:r><w:t>a</w:t></w:r></w:p></w:body></w:document>"#;
         let d = parse_document_xml(xml, &HashMap::new()).unwrap();
         assert_eq!(d.paragraphs.len(), 2);
+    }
+
+    #[test]
+    fn tables_round_trip() {
+        let cell = |t: u32, r: u16, c: u16, text: &str| Paragraph {
+            cell: Some(Cell {
+                table: t,
+                row: r,
+                col: c,
+            }),
+            ..Paragraph::plain(text)
+        };
+        let mut second = cell(0, 1, 1, "d & <e>").with_kind(Kind::Numbered);
+        second.cell = Some(Cell {
+            table: 0,
+            row: 1,
+            col: 1,
+        });
+        let d = Document::from_paragraphs(vec![
+            Paragraph::plain("intro"),
+            cell(0, 0, 0, "a"),
+            cell(0, 0, 0, "a2"),
+            cell(0, 0, 1, "b").with_kind(Kind::Heading(2)),
+            cell(0, 1, 0, "c"),
+            second,
+            Paragraph::plain("between"),
+            cell(1, 0, 0, "solo"),
+            Paragraph::plain("outro"),
+        ]);
+        assert_eq!(d.table_dims(0), Some((2, 2)));
+        let bytes = write(&d).unwrap();
+        let back = read(&bytes).unwrap();
+        assert_eq!(back, d);
+        let mut z = zip::ZipArchive::new(Cursor::new(&bytes[..])).unwrap();
+        let xml = read_part(&mut z, "word/document.xml").unwrap().unwrap();
+        assert_eq!(xml.matches("<w:tbl>").count(), 2);
+        assert_eq!(xml.matches("<w:tr>").count(), 3);
+        assert_eq!(xml.matches("<w:tc>").count(), 5);
+    }
+
+    #[test]
+    fn table_at_end_gets_a_trailing_paragraph() {
+        let d = Document::from_paragraphs(vec![Paragraph {
+            cell: Some(Cell {
+                table: 0,
+                row: 0,
+                col: 0,
+            }),
+            ..Paragraph::plain("x")
+        }]);
+        let back = read(&write(&d).unwrap()).unwrap();
+        assert_eq!(back.paragraphs.len(), 2);
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn nested_table_paragraphs_fold_into_outer_cell() {
+        let xml = r#"<w:document xmlns:w="x"><w:body><w:tbl><w:tr><w:tc><w:p><w:r><w:t>outer</w:t></w:r></w:p>
+            <w:tbl><w:tr><w:tc><w:p><w:r><w:t>inner</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:tc><w:tc><w:p><w:r><w:t>next</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>"#;
+        let d = parse_document_xml(xml, &HashMap::new()).unwrap();
+        let cells: Vec<_> = d
+            .paragraphs
+            .iter()
+            .filter_map(|p| p.cell.map(|c| (c.col, p.text())))
+            .collect();
+        assert_eq!(
+            cells,
+            vec![(0, "outer".into()), (0, "inner".into()), (1, "next".into())]
+        );
     }
 }
