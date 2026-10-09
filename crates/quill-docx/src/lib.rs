@@ -10,7 +10,8 @@ use std::io::{Cursor, Read, Write};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use quill_core::{
-    Align, Cell, Defaults, Document, Format, Image, Kind, Page, Paragraph, Run, OBJECT_CHAR,
+    is_field_char, Align, Cell, Defaults, Document, Format, Image, Kind, Page, Paragraph, Run,
+    Story, OBJECT_CHAR, PAGES_CHAR, PAGE_CHAR,
 };
 
 mod styles;
@@ -50,7 +51,8 @@ pub fn read(bytes: &[u8]) -> Result<Document, DocxError> {
         Some(n) => parse_numbering(&n)?,
         None => HashMap::new(),
     };
-    let media = read_media(&mut zip)?;
+    let rels = read_rels(&mut zip)?;
+    let media = read_media(&mut zip, &rels)?;
     let theme = match read_part(&mut zip, "word/theme/theme1.xml")? {
         Some(t) => styles::parse_theme(&t)?,
         None => Theme::default(),
@@ -59,7 +61,32 @@ pub fn read(bytes: &[u8]) -> Result<Document, DocxError> {
         Some(x) => Styles::parse(&x, theme)?,
         None => Styles::default(),
     };
-    parse_document_xml(&xml, &numbering, &media, &styles)
+    let main = parse_part(&xml, &numbering, &media, &styles, false)?;
+    let mut doc = Document::from_paragraphs(main.paras);
+    doc.images = main.images;
+    doc.page = main.page;
+    // Quill's built-in body font stands for "no explicit default".
+    let defaults = styles.defaults();
+    doc.defaults = Defaults {
+        font: defaults.font.filter(|f| &**f != DEFAULT_FONT),
+        size: defaults.size.filter(|&s| s != 24),
+    };
+    for (story, rid) in [(Story::Header, main.header), (Story::Footer, main.footer)] {
+        let Some((_, target)) = rid.and_then(|r| rels.get(&r)) else {
+            continue;
+        };
+        let Some(part) = read_part(&mut zip, &part_path(target))? else {
+            continue;
+        };
+        // Pictures in headers/footers aren't supported, so no media.
+        let parsed = parse_part(&part, &numbering, &Media::new(), &styles, true)?;
+        let mut paras = Document::from_paragraphs(parsed.paras).paragraphs;
+        for p in &mut paras {
+            p.cell = None; // tables in headers/footers are flattened
+        }
+        doc.set_story_paras(story, paras);
+    }
+    Ok(doc)
 }
 
 /// Embedded images by relationship id: `rId → (mime, bytes)`.
@@ -76,12 +103,15 @@ fn mime_for(path: &str) -> Option<&'static str> {
     }
 }
 
-fn read_media(zip: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<Media, DocxError> {
-    let mut media = Media::new();
-    let Some(rels) = read_part(zip, "word/_rels/document.xml.rels")? else {
-        return Ok(media);
+/// Relationships of `word/document.xml`: id → (type URI, target, is external).
+fn read_rels(
+    zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
+) -> Result<HashMap<String, (String, String)>, DocxError> {
+    let mut rels = HashMap::new();
+    let Some(xml) = read_part(zip, "word/_rels/document.xml.rels")? else {
+        return Ok(rels);
     };
-    let mut r = Reader::from_str(&rels);
+    let mut r = Reader::from_str(&xml);
     loop {
         match r.read_event()? {
             Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == "Relationship" => {
@@ -90,26 +120,41 @@ fn read_media(zip: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<Media, DocxErr
                 else {
                     continue;
                 };
-                if !kind.ends_with("/image")
-                    || attr(&e, "TargetMode").as_deref() == Some("External")
-                {
-                    continue;
-                }
-                let Some(mime) = mime_for(&target) else {
-                    continue;
-                };
-                let path = match target.strip_prefix('/') {
-                    Some(abs) => abs.to_string(),
-                    None => format!("word/{target}"),
-                };
-                if let Ok(mut f) = zip.by_name(&path) {
-                    let mut data = Vec::new();
-                    f.read_to_end(&mut data)?;
-                    media.insert(id, (mime.to_string(), data));
+                if attr(&e, "TargetMode").as_deref() != Some("External") {
+                    rels.insert(id, (kind, target));
                 }
             }
             Event::Eof => break,
             _ => {}
+        }
+    }
+    Ok(rels)
+}
+
+/// Path of a relationship target inside the package.
+fn part_path(target: &str) -> String {
+    match target.strip_prefix('/') {
+        Some(abs) => abs.to_string(),
+        None => format!("word/{target}"),
+    }
+}
+
+fn read_media(
+    zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    rels: &HashMap<String, (String, String)>,
+) -> Result<Media, DocxError> {
+    let mut media = Media::new();
+    for (id, (kind, target)) in rels {
+        if !kind.ends_with("/image") {
+            continue;
+        }
+        let Some(mime) = mime_for(target) else {
+            continue;
+        };
+        if let Ok(mut f) = zip.by_name(&part_path(target)) {
+            let mut data = Vec::new();
+            f.read_to_end(&mut data)?;
+            media.insert(id.clone(), (mime.to_string(), data));
         }
     }
     Ok(media)
@@ -238,12 +283,38 @@ fn run_format(
     }
 }
 
-fn parse_document_xml(
+/// Everything read from one `w:document`/`w:hdr`/`w:ftr` part.
+struct Parsed {
+    paras: Vec<Paragraph>,
+    images: Vec<Image>,
+    page: Page,
+    /// Relationship ids of the section's default header and footer.
+    header: Option<String>,
+    footer: Option<String>,
+}
+
+/// Page-number fields (`PAGE`, `NUMPAGES`) become placeholders in headers and
+/// footers; elsewhere a field keeps whatever result text it displays.
+fn field_placeholder(instr: &str) -> Option<char> {
+    match instr
+        .split_whitespace()
+        .next()?
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "PAGE" => Some(PAGE_CHAR),
+        "NUMPAGES" => Some(PAGES_CHAR),
+        _ => None,
+    }
+}
+
+fn parse_part(
     xml: &str,
     numbering: &HashMap<u32, bool>,
     media: &Media,
     styles: &Styles,
-) -> Result<Document, DocxError> {
+    hf: bool,
+) -> Result<Parsed, DocxError> {
     let mut r = Reader::from_str(xml);
     let defaults = styles.defaults();
     let theme = &styles.theme;
@@ -275,6 +346,11 @@ fn parse_document_xml(
             .map(|v| (v / 9525) as u32)
     };
     let mut page = Page::default();
+    let (mut header_rid, mut footer_rid): (Option<String>, Option<String>) = (None, None);
+    // Field state: the placeholder to emit in place of the field's result text
+    // (and whether it has been emitted), plus complex-field instruction text.
+    let mut field: Option<(char, bool)> = None;
+    let (mut in_instr, mut instr) = (false, String::new());
 
     // Resolve the current paragraph's style layers (once, when first needed).
     macro_rules! resolve {
@@ -312,6 +388,32 @@ fn parse_document_xml(
                 ));
             }
             run_fmt.clone().expect("just computed")
+        }};
+    }
+    // Add text to the current paragraph; inside a page-number field the
+    // result text is replaced by one placeholder character.
+    macro_rules! emit {
+        ($text:expr) => {{
+            let f = fmt_now!();
+            match field.as_mut() {
+                Some((ch, done)) => {
+                    if !*done {
+                        push(&mut cur, &ch.to_string(), &f);
+                        *done = true;
+                    }
+                }
+                None => push(&mut cur, $text, &f),
+            }
+        }};
+    }
+    // Close a field that produced no result text of its own.
+    macro_rules! close_field {
+        () => {{
+            if let Some((ch, false)) = field.take() {
+                let f = fmt_now!();
+                push(&mut cur, &ch.to_string(), &f);
+            }
+            field = None;
         }};
     }
     // Build a finished paragraph from the resolved layers.
@@ -384,6 +486,12 @@ fn parse_document_xml(
                 }
                 "blip" if in_drawing => embed = attr(&e, "embed"),
                 "pPr" => in_ppr = true,
+                "instrText" => in_instr = true,
+                "fldSimple" if hf => {
+                    field = attr(&e, "instr")
+                        .and_then(|i| field_placeholder(&i))
+                        .map(|c| (c, false));
+                }
                 "tbl" => {
                     depth += 1;
                     if depth == 1 {
@@ -447,6 +555,8 @@ fn parse_document_xml(
                     page.right = m("right", page.right);
                     page.bottom = m("bottom", page.bottom);
                     page.left = m("left", page.left);
+                    page.header = m("header", page.header);
+                    page.footer = m("footer", page.footer);
                 }
                 "pStyle" => {
                     para_style = attr(&e, "val");
@@ -458,23 +568,30 @@ fn parse_document_xml(
                     run_fmt = None;
                 }
                 "numId" => num_kind = numbering_kind(&e, numbering),
-                "tab" => {
-                    let f = fmt_now!();
-                    push(&mut cur, "\t", &f);
+                "tab" => emit!("\t"),
+                "br" => emit!("\n"),
+                "fldChar" if hf => match attr(&e, "fldCharType").as_deref() {
+                    Some("begin") => {
+                        instr.clear();
+                        field = None;
+                    }
+                    Some("separate") => field = field_placeholder(&instr).map(|c| (c, false)),
+                    Some("end") => close_field!(),
+                    _ => {}
+                },
+                "headerReference" if attr(&e, "type").is_none_or(|t| t == "default") => {
+                    header_rid = attr(&e, "id");
                 }
-                "br" => {
-                    let f = fmt_now!();
-                    push(&mut cur, "\n", &f);
+                "footerReference" if attr(&e, "type").is_none_or(|t| t == "default") => {
+                    footer_rid = attr(&e, "id");
                 }
                 _ => {}
             },
+            Event::Text(t) if in_instr => {
+                instr.push_str(&t.xml_content(quick_xml::XmlVersion::Implicit1_0));
+            }
             Event::Text(t) if in_text => {
-                let f = fmt_now!();
-                push(
-                    &mut cur,
-                    &t.xml_content(quick_xml::XmlVersion::Implicit1_0),
-                    &f,
-                );
+                emit!(&t.xml_content(quick_xml::XmlVersion::Implicit1_0));
             }
             Event::GeneralRef(g) if in_text => {
                 let s = match g.as_ref() {
@@ -485,10 +602,11 @@ fn parse_document_xml(
                     "apos" => "'",
                     _ => "",
                 };
-                let f = fmt_now!();
-                push(&mut cur, s, &f);
+                emit!(s);
             }
             Event::End(e) => match e.local_name().as_ref() {
+                "instrText" => in_instr = false,
+                "fldSimple" => close_field!(),
                 "t" => in_text = false,
                 "pPr" => in_ppr = false,
                 "drawing" => {
@@ -526,14 +644,27 @@ fn parse_document_xml(
             _ => {}
         }
     }
-    let mut doc = Document::from_paragraphs(paras);
-    doc.images = images;
-    doc.page = page;
-    // Quill's built-in body font stands for "no explicit default".
-    doc.defaults = Defaults {
-        font: defaults.font.filter(|f| &**f != DEFAULT_FONT),
-        size: defaults.size.filter(|&s| s != 24),
-    };
+    Ok(Parsed {
+        paras,
+        images,
+        page,
+        header: header_rid,
+        footer: footer_rid,
+    })
+}
+
+/// Parse just a main document part (used by tests that skip the package).
+#[cfg(test)]
+fn parse_document_xml(
+    xml: &str,
+    numbering: &HashMap<u32, bool>,
+    media: &Media,
+    styles: &Styles,
+) -> Result<Document, DocxError> {
+    let p = parse_part(xml, numbering, media, styles, false)?;
+    let mut doc = Document::from_paragraphs(p.paras);
+    doc.images = p.images;
+    doc.page = p.page;
     Ok(doc)
 }
 
@@ -618,6 +749,14 @@ fn run_xml(text: &str, f: &Format) -> String {
     };
     for c in text.chars() {
         match c {
+            c if is_field_char(c) => {
+                flush(&mut buf, &mut out);
+                let instr = if c == PAGE_CHAR { "PAGE" } else { "NUMPAGES" };
+                // The cached result is replaced by Word when it paginates.
+                out.push_str(&format!(
+                    "<w:fldSimple w:instr=\" {instr} \"><w:r>{rpr}<w:t>1</w:t></w:r></w:fldSimple>"
+                ));
+            }
             '\n' | '\t' => {
                 flush(&mut buf, &mut out);
                 out.push_str(&format!(
@@ -637,145 +776,196 @@ const NS_R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relati
 const NS_WP: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
 const XML_DECL: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>";
 
-pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
-    // Each contiguous run of numbered paragraphs gets its own list instance so
-    // numbering restarts at 1, as it does in Quill.
-    let mut body = String::new();
-    let mut numbered_lists = 0u32;
-    let mut prev_numbered = false;
-    let mut prev_cell: Option<Cell> = None;
-    let mut open_table: Option<(u32, u16, u16)> = None; // (table, row, col) currently open
-    let ncols_of = |t: u32| doc.table_dims(t).map_or(1, |d| d.1);
+/// Shared state for turning paragraphs into WordprocessingML, across the
+/// body and any header/footer parts of one document.
+struct Emit<'a> {
+    doc: &'a Document,
+    /// Numbered-list instances handed out so far (list numbering restarts per run).
+    numbered_lists: u32,
+    media: Vec<(String, std::sync::Arc<[u8]>)>,
+    /// image id → (relationship id, file name)
+    media_ids: HashMap<u32, (String, String)>,
+    drawings: usize,
+    /// Headers and footers hold text and fields only.
+    images: bool,
+}
 
-    let mut media: Vec<(String, std::sync::Arc<[u8]>)> = Vec::new();
-    let mut media_ids: HashMap<u32, (String, String)> = HashMap::new(); // image id → (rId, file name)
-    let mut drawings = 0usize;
+impl Emit<'_> {
+    fn paragraphs(&mut self, paras: &[Paragraph]) -> String {
+        let doc = self.doc;
+        let mut body = String::new();
+        let mut prev_numbered = false;
+        let mut prev_cell: Option<Cell> = None;
+        let mut open_table: Option<(u32, u16, u16)> = None; // (table, row, col) currently open
+        let ncols_of = |t: u32| doc.table_dims(t).map_or(1, |d| d.1);
 
-    for p in &doc.paragraphs {
-        // Close cells/rows/tables as the paragraph's cell changes.
-        let next = p.cell.map(|c| (c.table, c.row, c.col));
-        if open_table != next {
-            if let Some((t, r, c)) = open_table {
-                match next {
-                    Some((nt, nr, nc)) if nt == t && nr == r && nc != c => body.push_str("</w:tc>"),
-                    Some((nt, nr, _)) if nt == t && nr != r => body.push_str("</w:tc></w:tr>"),
-                    _ => body.push_str("</w:tc></w:tr></w:tbl>"),
-                }
-            }
-            if let Some((t, r, c)) = next {
-                let same_table = open_table.is_some_and(|o| o.0 == t);
-                let new_row = !same_table || open_table.is_some_and(|o| o.1 != r);
-                if !same_table {
-                    let n = ncols_of(t);
-                    body.push_str(
-                        "<w:tbl><w:tblPr><w:tblW w:w=\"5000\" w:type=\"pct\"/><w:tblBorders>",
-                    );
-                    for side in ["top", "left", "bottom", "right", "insideH", "insideV"] {
-                        body.push_str(&format!("<w:{side} w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"808080\"/>"));
+        for p in paras {
+            // Close cells/rows/tables as the paragraph's cell changes.
+            let next = p.cell.map(|c| (c.table, c.row, c.col));
+            if open_table != next {
+                if let Some((t, r, c)) = open_table {
+                    match next {
+                        Some((nt, nr, nc)) if nt == t && nr == r && nc != c => {
+                            body.push_str("</w:tc>")
+                        }
+                        Some((nt, nr, _)) if nt == t && nr != r => body.push_str("</w:tc></w:tr>"),
+                        _ => body.push_str("</w:tc></w:tr></w:tbl>"),
                     }
-                    body.push_str("</w:tblBorders></w:tblPr><w:tblGrid>");
-                    for _ in 0..n {
-                        body.push_str(&format!("<w:gridCol w:w=\"{}\"/>", 9000 / n));
+                }
+                if let Some((t, r, c)) = next {
+                    let same_table = open_table.is_some_and(|o| o.0 == t);
+                    let new_row = !same_table || open_table.is_some_and(|o| o.1 != r);
+                    if !same_table {
+                        let n = ncols_of(t);
+                        body.push_str(
+                            "<w:tbl><w:tblPr><w:tblW w:w=\"5000\" w:type=\"pct\"/><w:tblBorders>",
+                        );
+                        for side in ["top", "left", "bottom", "right", "insideH", "insideV"] {
+                            body.push_str(&format!("<w:{side} w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"808080\"/>"));
+                        }
+                        body.push_str("</w:tblBorders></w:tblPr><w:tblGrid>");
+                        for _ in 0..n {
+                            body.push_str(&format!("<w:gridCol w:w=\"{}\"/>", 9000 / n));
+                        }
+                        body.push_str("</w:tblGrid>");
                     }
-                    body.push_str("</w:tblGrid>");
+                    if new_row {
+                        body.push_str("<w:tr>");
+                    }
+                    let _ = c;
+                    body.push_str("<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/></w:tcPr>");
                 }
-                if new_row {
-                    body.push_str("<w:tr>");
-                }
-                let _ = c;
-                body.push_str("<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/></w:tcPr>");
+                open_table = next;
             }
-            open_table = next;
-        }
-        if p.cell != prev_cell {
-            prev_numbered = false;
-            prev_cell = p.cell;
-        }
-        let style_and_num = match p.kind {
+            if p.cell != prev_cell {
+                prev_numbered = false;
+                prev_cell = p.cell;
+            }
+            let style_and_num = match p.kind {
             Kind::Normal => String::new(),
             Kind::Heading(n) => format!("<w:pStyle w:val=\"Heading{n}\"/>"),
             Kind::Bullet => "<w:pStyle w:val=\"ListParagraph\"/><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr>".to_string(),
             Kind::Numbered => {
                 if !prev_numbered {
-                    numbered_lists += 1;
+                    self.numbered_lists += 1;
                 }
-                format!("<w:pStyle w:val=\"ListParagraph\"/><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"{}\"/></w:numPr>", numbered_lists + 1)
+                format!("<w:pStyle w:val=\"ListParagraph\"/><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"{}\"/></w:numPr>", self.numbered_lists + 1)
             }
         };
-        let jc = match p.align {
-            Align::Left => "",
-            Align::Center => "<w:jc w:val=\"center\"/>",
-            Align::Right => "<w:jc w:val=\"right\"/>",
-            Align::Justify => "<w:jc w:val=\"both\"/>",
-        };
-        let mut spacing = String::new();
-        if p.space_before.is_some() || p.space_after.is_some() || p.line_spacing.is_some() {
-            spacing.push_str("<w:spacing");
-            if let Some(v) = p.space_before {
-                spacing.push_str(&format!(" w:before=\"{v}\""));
+            let jc = match p.align {
+                Align::Left => "",
+                Align::Center => "<w:jc w:val=\"center\"/>",
+                Align::Right => "<w:jc w:val=\"right\"/>",
+                Align::Justify => "<w:jc w:val=\"both\"/>",
+            };
+            let mut spacing = String::new();
+            if p.space_before.is_some() || p.space_after.is_some() || p.line_spacing.is_some() {
+                spacing.push_str("<w:spacing");
+                if let Some(v) = p.space_before {
+                    spacing.push_str(&format!(" w:before=\"{v}\""));
+                }
+                if let Some(v) = p.space_after {
+                    spacing.push_str(&format!(" w:after=\"{v}\""));
+                }
+                if let Some(v) = p.line_spacing {
+                    spacing.push_str(&format!(" w:line=\"{v}\" w:lineRule=\"auto\""));
+                }
+                spacing.push_str("/>");
             }
-            if let Some(v) = p.space_after {
-                spacing.push_str(&format!(" w:after=\"{v}\""));
+            // List indents belong to the numbering definition.
+            let mut ind = String::new();
+            if !p.kind.is_list() && (p.indent_left.is_some() || p.indent_first.is_some()) {
+                ind.push_str("<w:ind");
+                if let Some(v) = p.indent_left {
+                    ind.push_str(&format!(" w:left=\"{v}\""));
+                }
+                match p.indent_first {
+                    Some(f) if f < 0 => ind.push_str(&format!(" w:hanging=\"{}\"", -(f as i32))),
+                    Some(f) => ind.push_str(&format!(" w:firstLine=\"{f}\"")),
+                    None => {}
+                }
+                ind.push_str("/>");
             }
-            if let Some(v) = p.line_spacing {
-                spacing.push_str(&format!(" w:line=\"{v}\" w:lineRule=\"auto\""));
-            }
-            spacing.push_str("/>");
-        }
-        // List indents belong to the numbering definition.
-        let mut ind = String::new();
-        if !p.kind.is_list() && (p.indent_left.is_some() || p.indent_first.is_some()) {
-            ind.push_str("<w:ind");
-            if let Some(v) = p.indent_left {
-                ind.push_str(&format!(" w:left=\"{v}\""));
-            }
-            match p.indent_first {
-                Some(f) if f < 0 => ind.push_str(&format!(" w:hanging=\"{}\"", -(f as i32))),
-                Some(f) => ind.push_str(&format!(" w:firstLine=\"{f}\"")),
-                None => {}
-            }
-            ind.push_str("/>");
-        }
-        let ppr =
-            if style_and_num.is_empty() && spacing.is_empty() && ind.is_empty() && jc.is_empty() {
+            let ppr = if style_and_num.is_empty()
+                && spacing.is_empty()
+                && ind.is_empty()
+                && jc.is_empty()
+            {
                 String::new()
             } else {
                 format!("<w:pPr>{style_and_num}{spacing}{ind}{jc}</w:pPr>")
             };
-        prev_numbered = p.kind == Kind::Numbered;
-        body.push_str("<w:p>");
-        body.push_str(&ppr);
-        for r in &p.runs {
-            let image = r
-                .format
-                .image
-                .and_then(|id| doc.images.get(id as usize).map(|i| (id, i)));
-            let ext = image.and_then(|(_, i)| ext_for(&i.mime));
-            let (Some((id, img)), Some(ext)) = (image, ext) else {
-                if r.format.image.is_none() {
-                    body.push_str(&run_xml(&r.text, &r.format));
+            prev_numbered = p.kind == Kind::Numbered;
+            body.push_str("<w:p>");
+            body.push_str(&ppr);
+            for r in &p.runs {
+                let image = r
+                    .format
+                    .image
+                    .filter(|_| self.images)
+                    .and_then(|id| doc.images.get(id as usize).map(|i| (id, i)));
+                let ext = image.and_then(|(_, i)| ext_for(&i.mime));
+                let (Some((id, img)), Some(ext)) = (image, ext) else {
+                    if r.format.image.is_none() {
+                        body.push_str(&run_xml(&r.text, &r.format));
+                    }
+                    continue; // images we can't embed are dropped
+                };
+                let (rid, _) = self.media_ids.entry(id).or_insert_with(|| {
+                    let n = self.media.len() + 1;
+                    self.media
+                        .push((format!("image{n}.{ext}"), img.data.clone()));
+                    (format!("rId{}", n + 2), format!("image{n}.{ext}"))
+                });
+                for _ in r.text.chars() {
+                    self.drawings += 1;
+                    body.push_str(&drawing_xml(rid, self.drawings, img.width, img.height));
                 }
-                continue; // images we can't embed are dropped
-            };
-            let (rid, _) = media_ids.entry(id).or_insert_with(|| {
-                let n = media.len() + 1;
-                media.push((format!("image{n}.{ext}"), img.data.clone()));
-                (format!("rId{}", n + 2), format!("image{n}.{ext}"))
-            });
-            for _ in r.text.chars() {
-                drawings += 1;
-                body.push_str(&drawing_xml(rid, drawings, img.width, img.height));
             }
+            body.push_str("</w:p>");
         }
-        body.push_str("</w:p>");
+        if open_table.is_some() {
+            body.push_str("</w:tc></w:tr></w:tbl><w:p/>"); // Word requires a paragraph after a table
+        }
+        body
     }
-    if open_table.is_some() {
-        body.push_str("</w:tc></w:tr></w:tbl><w:p/>"); // Word requires a paragraph after a table
-    }
+}
+
+pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
+    let mut em = Emit {
+        doc,
+        numbered_lists: 0,
+        media: Vec::new(),
+        media_ids: HashMap::new(),
+        drawings: 0,
+        images: true,
+    };
+    let body = em.paragraphs(doc.story_paras(Story::Body));
+    // Headers and footers: parts exist only when they hold something.
+    em.images = false;
+    let header = doc
+        .story_has_content(Story::Header)
+        .then(|| em.paragraphs(doc.story_paras(Story::Header)));
+    let footer = doc
+        .story_has_content(Story::Footer)
+        .then(|| em.paragraphs(doc.story_paras(Story::Footer)));
+    let Emit {
+        numbered_lists,
+        media,
+        media_ids,
+        ..
+    } = em;
     let pg = &doc.page;
+    let mut refs = String::new();
+    if header.is_some() {
+        refs.push_str("<w:headerReference w:type=\"default\" r:id=\"rIdHdr\"/>");
+    }
+    if footer.is_some() {
+        refs.push_str("<w:footerReference w:type=\"default\" r:id=\"rIdFtr\"/>");
+    }
     let sect = format!(
-        "<w:sectPr><w:pgSz w:w=\"{}\" w:h=\"{}\"/><w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/></w:sectPr>",
-        pg.width, pg.height, pg.top, pg.right, pg.bottom, pg.left
+        "<w:sectPr>{refs}<w:pgSz w:w=\"{}\" w:h=\"{}\"/><w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" w:header=\"{}\" w:footer=\"{}\" w:gutter=\"0\"/></w:sectPr>",
+        pg.width, pg.height, pg.top, pg.right, pg.bottom, pg.left, pg.header, pg.footer
     );
     let document = format!(
         "{XML_DECL}<w:document xmlns:w=\"{NS_W}\" xmlns:r=\"{NS_R}\" xmlns:wp=\"{NS_WP}\"><w:body>{body}{sect}</w:body></w:document>"
@@ -817,6 +1007,22 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
         heading(3, 28)
     );
 
+    let mut hf_types = String::new();
+    let mut hf_rels = String::new();
+    for (part, kind, present) in [
+        ("header1", "header", header.is_some()),
+        ("footer1", "footer", footer.is_some()),
+    ] {
+        if present {
+            hf_types.push_str(&format!(
+                "<Override PartName=\"/word/{part}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.{kind}+xml\"/>"
+            ));
+            let rid = if kind == "header" { "rIdHdr" } else { "rIdFtr" };
+            hf_rels.push_str(&format!(
+                "<Relationship Id=\"{rid}\" Type=\"{NS_R}/{kind}\" Target=\"{part}.xml\"/>"
+            ));
+        }
+    }
     let content_types = format!(
         "{XML_DECL}<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
 <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
@@ -828,7 +1034,7 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
 <Default Extension=\"bmp\" ContentType=\"image/bmp\"/>\
 <Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
 <Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>\
-<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/></Types>"
+<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>{hf_types}</Types>"
     );
     let rels = format!(
         "{XML_DECL}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
@@ -843,7 +1049,7 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
     let doc_rels = format!(
         "{XML_DECL}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
 <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>\
-<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>{image_rels}</Relationships>"
+<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>{image_rels}{hf_rels}</Relationships>"
     );
 
     let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -859,11 +1065,29 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, DocxError> {
         z.start_file(name, opts)?;
         z.write_all(data.as_bytes())?;
     }
+    let hdr_xml = header.map(|b| hf_xml("hdr", &b));
+    let ftr_xml = footer.map(|b| hf_xml("ftr", &b));
+    for (name, data) in [
+        ("word/header1.xml", &hdr_xml),
+        ("word/footer1.xml", &ftr_xml),
+    ] {
+        if let Some(xml) = data {
+            z.start_file(name, opts)?;
+            z.write_all(xml.as_bytes())?;
+        }
+    }
     for (name, data) in &media {
         z.start_file(format!("word/media/{name}"), opts)?;
         z.write_all(data)?;
     }
     Ok(z.finish()?.into_inner())
+}
+
+/// A header/footer part wrapping already-generated paragraphs.
+fn hf_xml(tag: &str, inner: &str) -> String {
+    format!(
+        "{XML_DECL}<w:{tag} xmlns:w=\"{NS_W}\" xmlns:r=\"{NS_R}\" xmlns:wp=\"{NS_WP}\">{inner}</w:{tag}>"
+    )
 }
 
 fn ext_for(mime: &str) -> Option<&'static str> {
@@ -1231,7 +1455,9 @@ mod tests {
                 top: 1134,
                 right: 850,
                 bottom: 1701,
-                left: 1417
+                left: 1417,
+                header: 708,
+                footer: 708,
             }
         );
     }
@@ -1392,5 +1618,153 @@ mod tests {
             styles.contains(r#"<w:rFonts w:ascii="Calibri""#)
                 && styles.contains(r#"<w:sz w:val="22"/>"#)
         );
+    }
+
+    fn hf_package(header: Option<&str>, footer: Option<&str>, body_extra: &str) -> Document {
+        let w = r#"xmlns:w="w" xmlns:r="r""#;
+        let mut refs = String::new();
+        let mut rels = String::new();
+        let mut parts: Vec<(&str, String)> = Vec::new();
+        if let Some(h) = header {
+            refs.push_str(r#"<w:headerReference w:type="default" r:id="rIdA"/><w:headerReference w:type="first" r:id="rIdZ"/>"#);
+            rels.push_str(r#"<Relationship Id="rIdA" Type="http://x/relationships/header" Target="header1.xml"/>"#);
+            parts.push(("word/header1.xml", format!(r#"<w:hdr {w}>{h}</w:hdr>"#)));
+        }
+        if let Some(f) = footer {
+            refs.push_str(r#"<w:footerReference w:type="default" r:id="rIdB"/>"#);
+            rels.push_str(r#"<Relationship Id="rIdB" Type="http://x/relationships/footer" Target="/word/footer9.xml"/>"#);
+            parts.push(("word/footer9.xml", format!(r#"<w:ftr {w}>{f}</w:ftr>"#)));
+        }
+        let doc = format!(
+            r#"<w:document {w}><w:body><w:p><w:r><w:t>body</w:t></w:r></w:p>{body_extra}<w:sectPr>{refs}<w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="360" w:footer="540"/></w:sectPr></w:body></w:document>"#
+        );
+        let rels_xml = format!(r#"<Relationships xmlns="r">{rels}</Relationships>"#);
+        let mut all: Vec<(&str, &str)> = vec![
+            ("word/document.xml", &doc),
+            ("word/_rels/document.xml.rels", &rels_xml),
+        ];
+        for (n, x) in &parts {
+            all.push((n, x));
+        }
+        read(&package(&all)).unwrap()
+    }
+
+    #[test]
+    fn headers_and_footers_are_read_with_simple_and_complex_page_fields() {
+        let d = hf_package(
+            Some(r#"<w:p><w:pPr><w:jc w:val="right"/></w:pPr><w:r><w:t>Company</w:t></w:r></w:p>"#),
+            Some(
+                r#"<w:p><w:pPr><w:jc w:val="center"/></w:pPr>
+                    <w:r><w:t xml:space="preserve">Page </w:t></w:r>
+                    <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+                    <w:r><w:instrText xml:space="preserve"> PAGE \* MERGEFORMAT </w:instrText></w:r>
+                    <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+                    <w:r><w:rPr><w:b/></w:rPr><w:t>7</w:t></w:r>
+                    <w:r><w:fldChar w:fldCharType="end"/></w:r>
+                    <w:r><w:t xml:space="preserve"> of </w:t></w:r>
+                    <w:fldSimple w:instr=" NUMPAGES "><w:r><w:t>9</w:t></w:r></w:fldSimple>
+                    <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+                    <w:r><w:instrText> PAGEREF _Toc1 </w:instrText></w:r>
+                    <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+                    <w:r><w:t>[ref]</w:t></w:r>
+                    <w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#,
+            ),
+            "",
+        );
+        assert_eq!(d.plain_text(), "body");
+        let h = &d.story_paras(Story::Header)[0];
+        assert_eq!((h.text().as_str(), h.align), ("Company", Align::Right));
+        let f = &d.story_paras(Story::Footer)[0];
+        assert_eq!(
+            f.text(),
+            format!("Page {PAGE_CHAR} of {PAGES_CHAR}[ref]"),
+            "other fields keep their result"
+        );
+        assert_eq!(f.align, Align::Center);
+        let page_run = f.runs.iter().find(|r| r.text.contains(PAGE_CHAR)).unwrap();
+        assert!(
+            page_run.format.bold,
+            "the field takes the formatting of its result run"
+        );
+        assert_eq!((d.page.header, d.page.footer), (360, 540));
+    }
+
+    #[test]
+    fn header_and_footer_round_trip_with_fields_and_formatting() {
+        let mut d = Document::from_paragraphs(vec![Paragraph::plain("body")]);
+        let mut h = Paragraph::plain("Quarterly report");
+        h.align = Align::Right;
+        h.runs[0].format.italic = true;
+        d.set_story_paras(Story::Header, vec![h]);
+        let mut f = Paragraph {
+            align: Align::Center,
+            ..Default::default()
+        };
+        f.runs.push(Run::new(
+            format!("Page {PAGE_CHAR} of {PAGES_CHAR}"),
+            Format::default(),
+        ));
+        f.runs.push(Run::new(
+            " — bold",
+            Format {
+                bold: true,
+                ..Format::default()
+            },
+        ));
+        d.set_story_paras(Story::Footer, vec![f, Paragraph::plain("second line")]);
+        d.page.header = 500;
+        d.page.footer = 600;
+        let bytes = write(&d).unwrap();
+        assert_eq!(read(&bytes).unwrap(), d);
+
+        let mut z = zip::ZipArchive::new(Cursor::new(&bytes[..])).unwrap();
+        let xml = read_part(&mut z, "word/document.xml").unwrap().unwrap();
+        assert!(xml.contains(r#"<w:headerReference w:type="default" r:id="rIdHdr"/>"#));
+        assert!(xml.contains(r#"w:header="500" w:footer="600""#));
+        let ftr = read_part(&mut z, "word/footer1.xml").unwrap().unwrap();
+        assert!(ftr.contains(r#"w:instr=" PAGE ""#) && ftr.contains(r#"w:instr=" NUMPAGES ""#));
+        let types = read_part(&mut z, "[Content_Types].xml").unwrap().unwrap();
+        assert!(
+            types.contains("wordprocessingml.header+xml")
+                && types.contains("wordprocessingml.footer+xml")
+        );
+        let rels = read_part(&mut z, "word/_rels/document.xml.rels")
+            .unwrap()
+            .unwrap();
+        assert!(rels.contains("Target=\"header1.xml\"") && rels.contains("Target=\"footer1.xml\""));
+    }
+
+    #[test]
+    fn empty_headers_and_footers_write_no_parts() {
+        let bytes = write(&Document::from_paragraphs(vec![Paragraph::plain("x")])).unwrap();
+        let mut z = zip::ZipArchive::new(Cursor::new(&bytes[..])).unwrap();
+        assert!(z.by_name("word/header1.xml").is_err() && z.by_name("word/footer1.xml").is_err());
+        let xml = read_part(&mut z, "word/document.xml").unwrap().unwrap();
+        assert!(!xml.contains("headerReference") && !xml.contains("footerReference"));
+    }
+
+    #[test]
+    fn header_images_tables_and_missing_parts_do_not_break_import() {
+        // A table in a footer is flattened; a picture is dropped; a missing part is ignored.
+        let d = hf_package(
+            None,
+            Some(
+                r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+                   <w:p><w:r><w:drawing><wp:inline xmlns:wp="wp"><wp:extent cx="9525" cy="9525"/></wp:inline></w:drawing></w:r></w:p>"#,
+            ),
+            "",
+        );
+        let f = d.story_paras(Story::Footer);
+        assert!(f.iter().all(|p| p.cell.is_none()));
+        assert_eq!(
+            f.iter().map(Paragraph::text).collect::<Vec<_>>().join("|"),
+            "A|B|"
+        );
+        assert!(d.images.is_empty());
+        let dangling = package(&[(
+            "word/document.xml",
+            r#"<w:document xmlns:w="w" xmlns:r="r"><w:body><w:p/><w:sectPr><w:footerReference r:id="rIdNope"/></w:sectPr></w:body></w:document>"#,
+        )]);
+        assert!(!read(&dangling).unwrap().story_has_content(Story::Footer));
     }
 }

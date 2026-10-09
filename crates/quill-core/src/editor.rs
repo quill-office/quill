@@ -30,6 +30,8 @@ pub struct Editor {
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     last: Option<Action>,
+    /// Where the caret was in each story when it was last left.
+    saved: [Pos; 3],
 }
 
 impl Default for Editor {
@@ -48,6 +50,7 @@ impl Editor {
             undo: vec![],
             redo: vec![],
             last: None,
+            saved: [Pos::default(); 3],
         }
     }
 
@@ -76,7 +79,11 @@ impl Editor {
     /// Selected text for the clipboard (images are left out).
     pub fn selected_text(&self) -> String {
         let (s, e) = self.selection();
-        self.doc.text_in_range(s, e).replace(OBJECT_CHAR, "")
+        self.doc
+            .text_in_range(s, e)
+            .chars()
+            .filter(|&c| c != OBJECT_CHAR && !is_field_char(c))
+            .collect()
     }
 
     pub fn can_undo(&self) -> bool {
@@ -209,7 +216,10 @@ impl Editor {
 
     /// Type or paste text, replacing any selection.
     pub fn insert_text(&mut self, text: &str) {
-        let text = text.replace(OBJECT_CHAR, "");
+        let text: String = text
+            .chars()
+            .filter(|&c| c != OBJECT_CHAR && !is_field_char(c))
+            .collect();
         let text = text.as_str();
         if text.is_empty() {
             return;
@@ -380,10 +390,64 @@ impl Editor {
         &self.doc.paragraphs[self.head.para]
     }
 
+    // ---- headers and footers -----------------------------------------------
+
+    /// The story being edited.
+    pub fn story(&self) -> Story {
+        self.doc.story
+    }
+
+    /// Switch to editing the body, header or footer, remembering the caret.
+    pub fn enter_story(&mut self, story: Story) {
+        if story == self.doc.story {
+            return;
+        }
+        self.saved[self.doc.story as usize] = self.head;
+        self.doc.switch_story(story);
+        let to = self.doc.clamp(self.saved[story as usize]);
+        self.head = to;
+        self.anchor = to;
+        self.pending = None;
+        self.last = None;
+    }
+
+    /// Insert a page-number (`PAGE_CHAR`) or page-count (`PAGES_CHAR`) field.
+    /// Only headers and footers can hold fields.
+    pub fn insert_field(&mut self, field: char) {
+        if self.doc.story == Story::Body || !is_field_char(field) {
+            return;
+        }
+        self.edit(Action::Other, |e| {
+            e.delete_selection();
+            let fmt = e.pending.take();
+            e.head = e.doc.insert_text(e.head, &field.to_string(), fmt.as_ref());
+            e.anchor = e.head;
+        });
+    }
+
+    /// Give the document a centred "page number" footer, replacing the footer.
+    pub fn add_page_numbers(&mut self) {
+        self.edit(Action::Other, |e| {
+            let page = Paragraph {
+                align: Align::Center,
+                runs: vec![Run::new(PAGE_CHAR.to_string(), Format::default())],
+                ..Default::default()
+            };
+            e.doc.set_story_paras(Story::Footer, vec![page]);
+            if e.doc.story == Story::Footer {
+                e.head = e.doc.clamp(e.head);
+                e.anchor = e.head;
+            }
+        });
+    }
+
     // ---- images ----------------------------------------------------------
 
     /// Insert an inline image (display size in px) at the caret.
     pub fn insert_image(&mut self, mime: &str, data: Vec<u8>, width: u32, height: u32) {
+        if self.doc.story != Story::Body {
+            return; // headers and footers hold text and fields only
+        }
         self.edit(Action::Other, |e| {
             e.delete_selection();
             e.head = e
@@ -419,6 +483,9 @@ impl Editor {
     /// Does nothing inside an existing table.
     pub fn insert_table(&mut self, rows: usize, cols: usize) {
         let (rows, cols) = (rows.clamp(1, 50), cols.clamp(1, 20));
+        if self.doc.story != Story::Body {
+            return;
+        }
         self.edit(Action::Other, |e| {
             e.delete_selection();
             if let Some(p) = e.doc.insert_table(e.head, rows, cols) {
@@ -1050,5 +1117,97 @@ mod tests {
         e.undo();
         assert_eq!(e.doc().page, Page::LETTER);
         assert_eq!(Page::px(1440), 96.0);
+    }
+
+    #[test]
+    fn stories_keep_their_own_content_and_carets() {
+        let mut e = ed("body text");
+        e.enter_story(Story::Header);
+        assert_eq!(e.story(), Story::Header);
+        assert_eq!(
+            e.doc().plain_text(),
+            "body text",
+            "plain_text is always the body"
+        );
+        e.insert_text("Top");
+        e.enter_story(Story::Footer);
+        e.insert_text("Bottom");
+        e.enter_story(Story::Body);
+        assert_eq!(e.head(), Pos { para: 0, offset: 9 }, "body caret restored");
+        e.insert_text("!");
+        assert_eq!(e.doc().plain_text(), "body text!");
+        assert_eq!(e.doc().story_paras(Story::Header)[0].text(), "Top");
+        assert_eq!(e.doc().story_paras(Story::Footer)[0].text(), "Bottom");
+        assert!(e.doc().story_has_content(Story::Header));
+        e.enter_story(Story::Header);
+        assert_eq!(e.head(), Pos { para: 0, offset: 3 });
+    }
+
+    #[test]
+    fn undo_follows_edits_across_stories() {
+        let mut e = ed("a");
+        e.enter_story(Story::Header);
+        e.insert_text("H");
+        e.enter_story(Story::Body);
+        e.insert_text("b");
+        e.undo(); // the body edit
+        assert_eq!(e.doc().plain_text(), "a");
+        e.undo(); // header edit: the editor returns to the header
+        assert_eq!(e.story(), Story::Header);
+        assert_eq!(e.doc().paragraphs[0].text(), "");
+        e.redo(); // back to the state before that undo: body active, header "H" parked
+        assert_eq!(e.story(), Story::Body);
+        assert_eq!(e.doc().story_paras(Story::Header)[0].text(), "H");
+    }
+
+    #[test]
+    fn fields_only_in_header_and_footer_and_never_from_typing() {
+        let mut e = ed("x");
+        e.insert_field(PAGE_CHAR);
+        assert_eq!(e.doc().plain_text(), "x", "no fields in the body");
+        e.enter_story(Story::Footer);
+        e.insert_text("Page ");
+        e.insert_field(PAGE_CHAR);
+        e.insert_text(" of ");
+        e.insert_field(PAGES_CHAR);
+        e.insert_text(&format!("{PAGE_CHAR}{OBJECT_CHAR}z")); // pasted placeholders are dropped
+        let p = &e.doc().paragraphs[0];
+        assert_eq!(p.text(), format!("Page {PAGE_CHAR} of {PAGES_CHAR}z"));
+        e.select_all();
+        assert_eq!(
+            e.selected_text(),
+            "Page  of z",
+            "fields are not copied as text"
+        );
+        let len = e.doc().paragraphs[0].len();
+        e.insert_field('x'); // not a field character: ignored (selection stays)
+        assert_eq!(e.doc().paragraphs[0].len(), len);
+        assert!(e.has_selection());
+    }
+
+    #[test]
+    fn page_numbers_shortcut_and_header_footer_restrictions() {
+        let mut e = ed("body");
+        e.add_page_numbers();
+        let footer = &e.doc().story_paras(Story::Footer)[0];
+        assert_eq!(
+            (footer.align, footer.text()),
+            (Align::Center, PAGE_CHAR.to_string())
+        );
+        assert_eq!(e.story(), Story::Body);
+        e.undo();
+        assert!(!e.doc().story_has_content(Story::Footer));
+        e.redo();
+        // Restrictions: no tables or images in headers/footers.
+        e.enter_story(Story::Footer);
+        let before = e.doc().clone();
+        e.insert_table(2, 2);
+        e.insert_image("image/png", vec![1], 10, 10);
+        assert_eq!(e.doc(), &before);
+        // Replacing the active footer keeps the caret valid.
+        e.insert_text("zzz");
+        e.add_page_numbers();
+        assert_eq!(e.doc().paragraphs[0].text(), PAGE_CHAR.to_string());
+        assert!(e.head().offset <= 1);
     }
 }

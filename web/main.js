@@ -34,6 +34,7 @@ Quill is an open-source office suite written in Rust and compiled to WebAssembly
 - Bold, italic and underline; fonts, sizes and colours; alignment; headings; lists
 - Tables: use the Table button, then Tab to move between cells
 - Images: use the Image button, or paste or drop one onto the page
+- Headers and footers: double-click the top or bottom margin, or use Page no. for page numbers
 - Pages, wrapping, and opening or saving .docx files
 ## Try it
 1. Press Ctrl+Z after typing to undo a burst of typing at once
@@ -89,6 +90,20 @@ function drawImage(ctx, it, baseline) {
   else { ctx.fillStyle = "#e5e7eb"; ctx.fillRect(it.x, baseline - h, w, h); ctx.fillStyle = TEXT_COLOR; }
 }
 
+/** Dashed line and label marking the header/footer area being edited. */
+function drawGuide(ctx) {
+  const header = frame.state.story === "header";
+  const y = header ? frame.page.top : frame.page.h - frame.page.bottom;
+  ctx.save();
+  ctx.strokeStyle = CARET_COLOR; ctx.fillStyle = CARET_COLOR; ctx.lineWidth = 1;
+  ctx.setLineDash([5, 4]);
+  ctx.beginPath(); ctx.moveTo(0, y + 0.5); ctx.lineTo(frame.page.w, y + 0.5); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.font = "11px system-ui, sans-serif"; ctx.textBaseline = header ? "top" : "bottom";
+  ctx.fillText(header ? "Header" : "Footer", 8, header ? y + 3 : y - 3);
+  ctx.restore();
+}
+
 function paint() {
   if (!frame) return;
   const focused = document.activeElement === ime;
@@ -103,6 +118,8 @@ function paint() {
     ctx.textBaseline = "alphabetic";
     for (const line of frame.layout.lines) {
       if (line.page !== p) continue;
+      // The story not being edited is shown faded, as in Word.
+      ctx.globalAlpha = line.story === "Body" ? (frame.state.story === "body" ? 1 : 0.35) : (line.story.toLowerCase() === frame.state.story ? 1 : 0.5);
       const by = line.y + line.baseline;
       if (line.marker && line.items[0]) {
         const it = line.items[0];
@@ -125,6 +142,8 @@ function paint() {
         }
       }
     }
+    ctx.globalAlpha = 1;
+    if (frame.state.story !== "body") drawGuide(ctx);
     ctx.fillStyle = SELECTION_COLOR;
     for (const r of frame.selection) if (r.page === p) ctx.fillRect(r.x, r.y, r.w, r.h);
     const c = frame.caret;
@@ -155,9 +174,14 @@ function updateToolbar() {
   for (const b of document.querySelectorAll("[data-align]")) b.setAttribute("aria-pressed", String(s.align === b.dataset.align));
   const sel = $("kind");
   sel.value = ["normal", "h1", "h2", "h3"].includes(s.kind) ? s.kind : "normal";
+  const inHf = s.story !== "body";
+  $("hfTools").hidden = !inHf;
+  $("editHeader").setAttribute("aria-pressed", String(s.story === "header"));
+  $("editFooter").setAttribute("aria-pressed", String(s.story === "footer"));
+  $("image").disabled = inHf;
   $("imageTools").hidden = !s.image_selected;
   $("tableTools").hidden = !s.in_table;
-  $("table").disabled = s.in_table;
+  $("table").disabled = s.in_table || inHf;
   $("undo").disabled = !s.can_undo;
   $("redo").disabled = !s.can_redo;
   const words = editor.text().replace(/\uFFFC/g, " ").split(/\s+/).filter(Boolean).length;
@@ -264,6 +288,10 @@ ime.addEventListener("keydown", (e) => {
     }
   } else {
     switch (e.key) {
+      case "Escape":
+        if (frame.state.story === "body") return;
+        editor.enter_story("body", frame.caret.page);
+        break;
       case "Enter": editor.enter(); break;
       case "Tab": editor.tab(e.shiftKey); break;
       case "Backspace": editor.backspace(); break;
@@ -324,6 +352,12 @@ $("paper").onchange = act(() => { if ($("paper").value) editor.set_paper($("pape
 $("spacing").onchange = act(() => editor.set_line_spacing(parseInt($("spacing").value, 10)));
 $("indentMore").onclick = act(() => editor.indent(720));
 $("indentLess").onclick = act(() => editor.indent(-720));
+$("pageNumbers").onclick = act(() => editor.add_page_numbers());
+const toggleStory = (name) => () => editor.enter_story(frame.state.story === name ? "body" : name, frame.caret.page);
+$("editHeader").onclick = act(toggleStory("header"));
+$("editFooter").onclick = act(toggleStory("footer"));
+$("closeHf").onclick = act(() => editor.enter_story("body", frame.caret.page));
+for (const b of document.querySelectorAll("[data-field]")) b.onclick = act(() => editor.insert_field(b.dataset.field));
 $("table").onclick = act(() => editor.insert_table(3, 3));
 for (const b of document.querySelectorAll("[data-table]")) b.onclick = act(() => editor.table_op(b.dataset.table));
 $("kind").onchange = act(() => editor.toggle_kind($("kind").value));

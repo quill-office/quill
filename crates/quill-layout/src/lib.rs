@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use quill_core::{Align, Document, Format, Image, Kind, Page, Paragraph, Pos, OBJECT_CHAR};
+use quill_core::{
+    Align, Document, Format, Image, Kind, Page, Paragraph, Pos, Story, OBJECT_CHAR, PAGE_CHAR,
+};
 use serde::Serialize;
 
 /// Default body text size in CSS px (12 pt).
@@ -50,6 +52,9 @@ pub struct PageSetup {
     pub right: f32,
     pub bottom: f32,
     pub left: f32,
+    /// Distance from the page edge to header/footer text.
+    pub header: f32,
+    pub footer: f32,
 }
 
 impl PageSetup {
@@ -64,6 +69,8 @@ impl PageSetup {
             right: margin,
             bottom: margin,
             left: margin,
+            header: margin / 2.0,
+            footer: margin / 2.0,
         }
     }
 
@@ -75,6 +82,8 @@ impl PageSetup {
             right: Page::px(p.right),
             bottom: Page::px(p.bottom),
             left: Page::px(p.left),
+            header: Page::px(p.header),
+            footer: Page::px(p.footer),
         }
     }
 }
@@ -104,6 +113,9 @@ struct Ctx<'a> {
     images: &'a [Image],
     base: f32,
     font: Option<Arc<str>>,
+    story: Story,
+    /// `(page number, page count)` for header/footer fields.
+    fields: Option<(usize, usize)>,
 }
 
 fn style_for(kind: Kind, f: &Format, ctx: &Ctx) -> TextStyle {
@@ -156,6 +168,8 @@ pub struct Item {
     pub start: usize,
     /// Set for an inline image; `text` is then a single object character.
     pub image: Option<ImageBox>,
+    /// Occupies one model character whatever `text` shows (images, fields).
+    pub atomic: bool,
 }
 
 impl Item {
@@ -171,7 +185,11 @@ impl Item {
     }
 
     fn len(&self) -> usize {
-        self.text.chars().count()
+        if self.atomic {
+            1
+        } else {
+            self.text.chars().count()
+        }
     }
 }
 
@@ -183,6 +201,7 @@ pub struct Marker {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Line {
+    pub story: Story,
     pub para: usize,
     pub page: usize,
     /// Left edge of the text area (after list indent).
@@ -203,9 +222,19 @@ pub struct Line {
     pub right: f32,
 }
 
+/// Which story the caret is in, and on which page it is shown (headers and
+/// footers repeat on every page, so the page disambiguates).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Focus {
+    pub story: Story,
+    pub page: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Layout {
     pub lines: Vec<Line>,
+    #[serde(skip)]
+    pub focus: Focus,
     /// Table cell boxes, for drawing borders.
     pub cells: Vec<Rect>,
     pub pages: usize,
@@ -283,6 +312,25 @@ impl Pager {
 }
 
 /// Add an item to a line, growing the line to fit it.
+/// Split text into runs of ordinary text and single field placeholders.
+fn segments(text: &str) -> Vec<(bool, &str)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        if quill_core::is_field_char(c) {
+            if start < i {
+                out.push((false, &text[start..i]));
+            }
+            out.push((true, &text[i..i + c.len_utf8()]));
+            start = i + c.len_utf8();
+        }
+    }
+    if start < text.len() {
+        out.push((false, &text[start..]));
+    }
+    out
+}
+
 fn push_item(line: &mut Line, it: Item, ascent: f32, descent: f32) {
     if line.items.is_empty() {
         // The first item replaces the empty-line defaults.
@@ -325,7 +373,7 @@ fn align_lines(
         };
         let content_w = line.items.last().map_or(0.0, |it| {
             let trimmed = it.text.trim_end();
-            let w = if it.image.is_some() || trimmed.len() == it.text.len() {
+            let w = if it.atomic || trimmed.len() == it.text.len() {
                 it.w
             } else {
                 m.width(trimmed, &it.style())
@@ -341,7 +389,7 @@ fn align_lines(
                 let n = line.items.len();
                 let gaps = line.items[..n.saturating_sub(1)]
                     .iter()
-                    .filter(|i| i.image.is_none() && i.text.ends_with(char::is_whitespace))
+                    .filter(|i| !i.atomic && i.text.ends_with(char::is_whitespace))
                     .count();
                 if li + 1 < count && !hard_break && gaps > 0 {
                     let extra = slack / gaps as f32;
@@ -349,7 +397,7 @@ fn align_lines(
                     for i in 0..n {
                         line.items[i].x += acc;
                         if i + 1 < n
-                            && line.items[i].image.is_none()
+                            && !line.items[i].atomic
                             && line.items[i].text.ends_with(char::is_whitespace)
                         {
                             acc += extra;
@@ -408,6 +456,7 @@ fn para_lines(
     };
     // An empty line is as tall as the paragraph's default text.
     let new_line = |start: usize, marker: Option<Marker>| Line {
+        story: ctx.story,
         para: pi,
         page: 0,
         x: x0,
@@ -442,6 +491,7 @@ fn para_lines(
             w,
             start,
             image: None,
+            atomic: false,
         };
         if let Some(id) = run.format.image {
             // One inline image per object character.
@@ -463,6 +513,7 @@ fn para_lines(
                 }
                 let mut it = item(x, &OBJECT_CHAR.to_string(), offset, w);
                 it.image = Some(ImageBox { id, uid, w, h });
+                it.atomic = true;
                 // The image sits on the baseline; the line grows to hold it.
                 push_item(&mut cur, it, h, descent);
                 x += w;
@@ -470,47 +521,68 @@ fn para_lines(
             }
             continue;
         }
-        for tok in tokens(&run.text) {
-            let n = tok.chars().count();
-            let w = m.width(tok, &st);
-            if x + w > avail && !cur.items.is_empty() {
-                cur.end = offset;
-                lines.push(std::mem::replace(&mut cur, new_line(offset, None)));
-                x = 0.0;
-            }
-            if w > avail {
-                // A single word wider than the line: break it by chars.
-                let chars: Vec<char> = tok.chars().collect();
-                let mut i = 0;
-                while i < chars.len() {
-                    let mut j = i + 1;
-                    while j < chars.len() {
-                        let cand: String = chars[i..=j].iter().collect();
-                        if m.width(&cand, &st) > avail {
-                            break;
-                        }
-                        j += 1;
-                    }
-                    let chunk: String = chars[i..j].iter().collect();
-                    let cw = m.width(&chunk, &st);
-                    push_item(&mut cur, item(x, &chunk, offset + i, cw), st.size, descent);
-                    x += cw;
-                    i = j;
-                    if i < chars.len() {
-                        cur.end = offset + i;
-                        lines.push(std::mem::replace(&mut cur, new_line(offset + i, None)));
-                        x = 0.0;
-                    }
+        for (is_field, piece) in segments(&run.text) {
+            if is_field {
+                let shown = match (piece.starts_with(PAGE_CHAR), ctx.fields) {
+                    (_, None) => "#".to_string(),
+                    (true, Some((page, _))) => page.to_string(),
+                    (false, Some((_, pages))) => pages.to_string(),
+                };
+                let w = m.width(&shown, &st);
+                if x + w > avail && !cur.items.is_empty() {
+                    cur.end = offset;
+                    lines.push(std::mem::replace(&mut cur, new_line(offset, None)));
+                    x = 0.0;
                 }
-            } else {
-                push_item(&mut cur, item(x, tok, offset, w), st.size, descent);
+                let mut it = item(x, &shown, offset, w);
+                it.atomic = true;
+                push_item(&mut cur, it, st.size, descent);
                 x += w;
+                offset += 1;
+                continue;
             }
-            offset += n;
-            if tok.ends_with('\n') {
-                cur.end = offset;
-                lines.push(std::mem::replace(&mut cur, new_line(offset, None)));
-                x = 0.0;
+            for tok in tokens(piece) {
+                let n = tok.chars().count();
+                let w = m.width(tok, &st);
+                if x + w > avail && !cur.items.is_empty() {
+                    cur.end = offset;
+                    lines.push(std::mem::replace(&mut cur, new_line(offset, None)));
+                    x = 0.0;
+                }
+                if w > avail {
+                    // A single word wider than the line: break it by chars.
+                    let chars: Vec<char> = tok.chars().collect();
+                    let mut i = 0;
+                    while i < chars.len() {
+                        let mut j = i + 1;
+                        while j < chars.len() {
+                            let cand: String = chars[i..=j].iter().collect();
+                            if m.width(&cand, &st) > avail {
+                                break;
+                            }
+                            j += 1;
+                        }
+                        let chunk: String = chars[i..j].iter().collect();
+                        let cw = m.width(&chunk, &st);
+                        push_item(&mut cur, item(x, &chunk, offset + i, cw), st.size, descent);
+                        x += cw;
+                        i = j;
+                        if i < chars.len() {
+                            cur.end = offset + i;
+                            lines.push(std::mem::replace(&mut cur, new_line(offset + i, None)));
+                            x = 0.0;
+                        }
+                    }
+                } else {
+                    push_item(&mut cur, item(x, tok, offset, w), st.size, descent);
+                    x += w;
+                }
+                offset += n;
+                if tok.ends_with('\n') {
+                    cur.end = offset;
+                    lines.push(std::mem::replace(&mut cur, new_line(offset, None)));
+                    x = 0.0;
+                }
             }
         }
     }
@@ -532,10 +604,13 @@ fn para_lines(
 
 pub fn layout(doc: &Document, setup: PageSetup, m: &dyn Measure) -> Layout {
     let content_w = setup.width - setup.left - setup.right;
+    let paras = doc.story_paras(Story::Body);
     let ctx = Ctx {
         images: &doc.images,
         base: base_size(doc),
         font: doc.defaults.font.clone(),
+        story: Story::Body,
+        fields: None,
     };
     let mut pager = Pager {
         lines: vec![],
@@ -547,8 +622,8 @@ pub fn layout(doc: &Document, setup: PageSetup, m: &dyn Measure) -> Layout {
     };
     let mut number = 0usize;
     let mut i = 0;
-    while i < doc.paragraphs.len() {
-        let para = &doc.paragraphs[i];
+    while i < paras.len() {
+        let para = &paras[i];
         let Some(first) = para.cell else {
             number = if para.kind == Kind::Numbered {
                 number + 1
@@ -574,12 +649,8 @@ pub fn layout(doc: &Document, setup: PageSetup, m: &dyn Measure) -> Layout {
         let mut j = i;
         let mut rows: Vec<Vec<Vec<usize>>> = Vec::new(); // row → col → paragraph indices
         let mut last: Option<(u16, u16)> = None;
-        while j < doc.paragraphs.len()
-            && doc.paragraphs[j]
-                .cell
-                .is_some_and(|c| c.table == first.table)
-        {
-            let c = doc.paragraphs[j].cell.expect("checked");
+        while j < paras.len() && paras[j].cell.is_some_and(|c| c.table == first.table) {
+            let c = paras[j].cell.expect("checked");
             if last.map(|l| l.0) != Some(c.row) {
                 rows.push(Vec::new());
             }
@@ -604,7 +675,7 @@ pub fn layout(doc: &Document, setup: PageSetup, m: &dyn Measure) -> Layout {
                 let (mut y, mut n, mut lines) = (0.0f32, 0usize, Vec::new());
                 let mut trailing = 0.0;
                 for &pi in cell {
-                    let p = &doc.paragraphs[pi];
+                    let p = &paras[pi];
                     n = if p.kind == Kind::Numbered { n + 1 } else { 0 };
                     y += before_px(p);
                     for mut line in para_lines(pi, p, &ctx, left, col_w - 2.0 * CELL_PAD, n, m) {
@@ -641,35 +712,87 @@ pub fn layout(doc: &Document, setup: PageSetup, m: &dyn Measure) -> Layout {
         i = j;
     }
     let pages = pager.page + 1;
+    let mut lines = pager.lines;
+
+    // Headers and footers repeat on every page, each with its own page number.
+    let empty = [Paragraph::default()];
+    for story in [Story::Header, Story::Footer] {
+        let src = doc.story_paras(story);
+        let src = if src.is_empty() { &empty[..] } else { src };
+        for page in 0..pages {
+            let hf_ctx = Ctx {
+                images: &doc.images,
+                base: ctx.base,
+                font: ctx.font.clone(),
+                story,
+                fields: Some((page + 1, pages)),
+            };
+            let (mut y, mut number, mut local) = (0.0f32, 0usize, Vec::new());
+            for (pi, p) in src.iter().enumerate() {
+                number = if p.kind == Kind::Numbered {
+                    number + 1
+                } else {
+                    0
+                };
+                y += before_px(p);
+                for mut line in para_lines(pi, p, &hf_ctx, setup.left, content_w, number, m) {
+                    line.y = y;
+                    y += line.height;
+                    local.push(line);
+                }
+                // No default paragraph gap: footer text should sit on its margin.
+                y += p.space_after.map_or(0.0, twips_px);
+            }
+            let top = match story {
+                Story::Footer => setup.height - setup.footer - y,
+                _ => setup.header,
+            };
+            for mut line in local {
+                line.page = page;
+                line.y += top;
+                lines.push(line);
+            }
+        }
+    }
     Layout {
-        lines: pager.lines,
+        lines,
         cells: pager.cells,
         pages,
+        focus: Focus::default(),
     }
 }
 
 /// Width of the first `chars` characters of an item.
 fn prefix_width(it: &Item, chars: usize, m: &dyn Measure) -> f32 {
-    match &it.image {
-        Some(b) => {
-            if chars == 0 {
-                0.0
-            } else {
-                b.w
-            }
+    if it.atomic {
+        if chars == 0 {
+            0.0
+        } else {
+            it.w
         }
-        None => {
-            let prefix: String = it.text.chars().take(chars).collect();
-            m.width(&prefix, &it.style())
-        }
+    } else {
+        let prefix: String = it.text.chars().take(chars).collect();
+        m.width(&prefix, &it.style())
     }
 }
 
 impl Layout {
+    /// Whether lines `a` and `b` belong to the same paragraph (header and
+    /// footer paragraphs repeat on each page, so the page counts too).
+    fn same_para(a: &Line, b: &Line) -> bool {
+        a.story == b.story && a.para == b.para && (a.story == Story::Body || a.page == b.page)
+    }
+
     fn is_last_line(&self, li: usize) -> bool {
         self.lines
             .get(li + 1)
-            .is_none_or(|n| n.para != self.lines[li].para)
+            .is_none_or(|n| !Self::same_para(n, &self.lines[li]))
+    }
+
+    /// Whether a line is in the story (and, for header/footer, the page) the
+    /// caret is in.
+    fn in_focus(&self, l: &Line) -> bool {
+        l.story == self.focus.story && (l.story == Story::Body || l.page == self.focus.page)
     }
 
     /// Largest offset the caret may take on a line: not past a soft-wrap space.
@@ -689,9 +812,16 @@ impl Layout {
     /// Index of the line holding `pos`; a caret at a wrap point belongs to the
     /// start of the next line.
     pub fn line_index(&self, pos: Pos) -> usize {
+        let holds = |l: &Line| l.para == pos.para && l.start <= pos.offset;
         self.lines
             .iter()
-            .rposition(|l| l.para == pos.para && l.start <= pos.offset)
+            .rposition(|l| self.in_focus(l) && holds(l))
+            // The focused page may not exist (e.g. after the document shrank).
+            .or_else(|| {
+                self.lines
+                    .iter()
+                    .rposition(|l| l.story == self.focus.story && holds(l))
+            })
             .unwrap_or(self.lines.len() - 1)
     }
 
@@ -754,7 +884,7 @@ impl Layout {
             .lines
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.page == page)
+            .filter(|(_, l)| l.page == page && l.story == self.focus.story)
         {
             let dy = if y < l.y {
                 l.y - y
@@ -786,6 +916,9 @@ impl Layout {
         let top = |l: &Line| l.page as f32 * 1.0e6 + l.y;
         let mut best: Option<(usize, bool, f32, f32)> = None; // (line, in column, gap, dx)
         for (i, l) in self.lines.iter().enumerate() {
+            if !self.in_focus(l) {
+                continue;
+            }
             let gap = if dir > 0 {
                 top(l) - (top(cur) + cur.height)
             } else {
@@ -835,7 +968,7 @@ impl Layout {
             return out;
         }
         for (li, l) in self.lines.iter().enumerate() {
-            if l.para < start.para || l.para > end.para {
+            if !self.in_focus(l) || l.para < start.para || l.para > end.para {
                 continue;
             }
             let lo = if l.para == start.para {
@@ -871,6 +1004,14 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Layout restricted to the body, so counts and indexes ignore the
+    /// header and footer lines present on every page.
+    fn lay(doc: &Document, setup: PageSetup, m: &dyn Measure) -> Layout {
+        let mut l = layout(doc, setup, m);
+        l.lines.retain(|x| x.story == Story::Body);
+        l
+    }
     use quill_core::{Align, Paragraph};
 
     /// Height of a default text line.
@@ -891,7 +1032,7 @@ mod tests {
     #[test]
     fn wraps_at_width() {
         let d = doc(&["aaaa bbbb cccc"]);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         assert_eq!(l.lines.len(), 2);
         assert_eq!(l.lines[1].items[0].text, "cccc");
         assert_eq!(l.lines[1].start, 10);
@@ -899,13 +1040,13 @@ mod tests {
 
     #[test]
     fn empty_paragraph_has_a_line() {
-        assert_eq!(layout(&Document::default(), SETUP, &m).lines.len(), 1);
+        assert_eq!(lay(&Document::default(), SETUP, &m).lines.len(), 1);
     }
 
     #[test]
     fn long_word_is_broken_by_chars() {
         let d = doc(&["abcdefghijklmnopqrstuvwxyz"]);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         let texts: Vec<_> = l.lines.iter().map(|l| l.items[0].text.as_str()).collect();
         assert_eq!(texts, ["abcdefghij", "klmnopqrst", "uvwxyz"]);
         assert_eq!(l.lines[2].start, 20);
@@ -915,7 +1056,7 @@ mod tests {
     fn forced_newline_breaks_line() {
         let mut d = doc(&["ab"]);
         d.paragraphs[0].runs[0].text = "ab\ncd".into();
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         assert_eq!(l.lines.len(), 2);
         assert_eq!(l.lines[1].start, 3);
     }
@@ -923,7 +1064,7 @@ mod tests {
     #[test]
     fn paginates() {
         let d = doc(&["a", "b", "c", "d", "e"]);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         assert!(l.pages >= 2, "pages = {}", l.pages);
         assert_eq!(l.lines[0].page, 0);
         assert_eq!(l.lines.last().unwrap().page, l.pages - 1);
@@ -944,7 +1085,7 @@ mod tests {
             Paragraph::plain("d").with_kind(Kind::Numbered),
             Paragraph::plain("e").with_kind(Kind::Bullet),
         ]);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         let marks: Vec<_> = l
             .lines
             .iter()
@@ -965,7 +1106,7 @@ mod tests {
     #[test]
     fn heading_is_larger_and_bold() {
         let d = Document::from_paragraphs(vec![Paragraph::plain("T").with_kind(Kind::Heading(1))]);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         assert_eq!(
             l.lines[0].items[0].size,
             para_size(Kind::Heading(1), BASE_SIZE)
@@ -977,7 +1118,7 @@ mod tests {
     #[test]
     fn caret_at_wrap_point_is_on_next_line() {
         let d = doc(&["aaaa bbbb cccc"]);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         let c = l.caret(
             Pos {
                 para: 0,
@@ -991,7 +1132,7 @@ mod tests {
     #[test]
     fn hit_test_round_trips_caret_across_pages() {
         let d = doc(&["aaaa bbbb cccc", "xyz", "q", "r", "s"]);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         assert!(l.pages > 1);
         for pos in [
             Pos { para: 0, offset: 3 },
@@ -1010,7 +1151,7 @@ mod tests {
     #[test]
     fn click_past_wrapped_line_end_stays_on_that_line() {
         let d = doc(&["aaaa bbbb cccc"]);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         let p = l.hit_test(0, 500.0, SETUP.left + 1.0, &m);
         assert_eq!(p, Pos { para: 0, offset: 9 }, "before the soft-wrap space");
     }
@@ -1018,7 +1159,7 @@ mod tests {
     #[test]
     fn vertical_keeps_goal_x() {
         let d = doc(&["aaaa bbbb cccc", "xy"]);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         let from = Pos { para: 0, offset: 3 };
         let gx = l.caret(from, &m).x;
         let down = l.vertical(from, 1, gx, &m);
@@ -1042,7 +1183,7 @@ mod tests {
     #[test]
     fn selection_rects_cover_lines_and_paragraph_breaks() {
         let d = doc(&["aaaa bbbb cccc", "xy"]);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         let r = l.selection_rects(Pos { para: 0, offset: 2 }, Pos { para: 1, offset: 1 }, &m);
         assert_eq!(r.len(), 3);
         assert_eq!(r[0].x, SETUP.left + 20.0);
@@ -1059,7 +1200,7 @@ mod tests {
     #[test]
     fn line_range_excludes_soft_wrap_space() {
         let d = doc(&["aaaa bbbb cccc"]);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         assert_eq!(l.line_range(Pos { para: 0, offset: 2 }), (0, 9));
         assert_eq!(
             l.line_range(Pos {
@@ -1093,7 +1234,7 @@ mod tests {
     #[test]
     fn table_cells_share_row_height_and_columns() {
         let d = table_doc(&[&["a", "b c d e f g h i j k l m n o p q r s t"], &["x", "y"]]);
-        let l = layout(&d, WIDE, &m);
+        let l = lay(&d, WIDE, &m);
         assert_eq!(l.cells.len(), 4);
         let col_w = 220.0 / 2.0;
         assert_eq!(l.cells[0].w, col_w);
@@ -1133,7 +1274,7 @@ mod tests {
         let rows: Vec<&[&str]> = vec![&["a", "b"]; 12];
         let d = table_doc(&rows);
         let tight = PageSetup::uniform(300.0, 40.0 * 2.0 + 150.0, 40.0);
-        let l = layout(&d, tight, &m);
+        let l = lay(&d, tight, &m);
         assert!(l.pages > 1);
         for c in &l.cells {
             assert!(
@@ -1148,7 +1289,7 @@ mod tests {
     #[test]
     fn hit_test_and_vertical_follow_columns() {
         let d = table_doc(&[&["aaa", "bbb"], &["ccc", "ddd"]]);
-        let l = layout(&d, WIDE, &m);
+        let l = lay(&d, WIDE, &m);
         // paragraphs: 0 before, 1 aaa, 2 bbb, 3 ccc, 4 ddd, 5 after
         let right_col_x = 40.0 + 110.0 + CELL_PAD + 5.0;
         let top = l.lines.iter().find(|l| l.para == 2).unwrap();
@@ -1170,7 +1311,7 @@ mod tests {
         for i in [1, 2] {
             d.paragraphs[i].kind = Kind::Numbered;
         }
-        let l = layout(&d, WIDE, &m);
+        let l = lay(&d, WIDE, &m);
         let marks: Vec<_> = l
             .lines
             .iter()
@@ -1191,7 +1332,7 @@ mod tests {
     #[test]
     fn inline_image_grows_line_and_sits_on_baseline() {
         let d = image_doc(50, 100);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         let line = &l.lines[0];
         let img = line.items.iter().find(|i| i.image.is_some()).unwrap();
         assert_eq!(img.image.unwrap().h, 100.0);
@@ -1208,7 +1349,7 @@ mod tests {
     #[test]
     fn oversized_image_is_scaled_to_the_line_width() {
         let d = image_doc(400, 200);
-        let l = layout(&d, SETUP, &m); // 100px wide text area
+        let l = lay(&d, SETUP, &m); // 100px wide text area
         let img = l
             .lines
             .iter()
@@ -1221,7 +1362,7 @@ mod tests {
     #[test]
     fn image_wraps_like_a_word() {
         let d = image_doc(60, 20); // "ab" (20px) + image (60) fits; then " cd" would not on same line
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         assert!(l.lines.len() >= 2);
         assert!(l
             .lines
@@ -1233,7 +1374,7 @@ mod tests {
     #[test]
     fn caret_and_hit_test_around_an_image() {
         let d = image_doc(30, 20);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         let before = l.caret(Pos { para: 0, offset: 2 }, &m);
         let after = l.caret(Pos { para: 0, offset: 3 }, &m);
         assert_eq!(after.x - before.x, 30.0);
@@ -1271,7 +1412,7 @@ mod tests {
     fn mixed_sizes_share_a_baseline_and_grow_the_line() {
         // 48 half-points = 24pt = 32px.
         let d = sized(&[("ab ", None), ("CD", Some(48)), (" ef", None)]);
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         let line = &l.lines[0];
         let sizes: Vec<_> = line.items.iter().map(|i| i.size).collect();
         assert_eq!(
@@ -1282,10 +1423,10 @@ mod tests {
         assert_eq!(line.baseline, 32.0, "tallest text sets the baseline");
         assert!((line.height - 32.0 * LINE_FACTOR).abs() < 1e-3);
         // A line of only small text is back to the default height.
-        let small = layout(&sized(&[("ab", None)]), SETUP, &m);
+        let small = lay(&sized(&[("ab", None)]), SETUP, &m);
         assert!((small.lines[0].height - LH).abs() < 1e-3);
         // Lone small text in a paragraph is shorter than the default line.
-        let tiny = layout(&sized(&[("ab", Some(12))]), SETUP, &m); // 6pt = 8px
+        let tiny = lay(&sized(&[("ab", Some(12))]), SETUP, &m); // 6pt = 8px
         assert!(tiny.lines[0].height < LH);
     }
 
@@ -1294,7 +1435,7 @@ mod tests {
         let mut p = Paragraph::plain("hi");
         p.runs[0].format.font = Some("Courier New".into());
         p.runs[0].format.color = Some(0xFF0000);
-        let l = layout(&Document::from_paragraphs(vec![p]), SETUP, &m);
+        let l = lay(&Document::from_paragraphs(vec![p]), SETUP, &m);
         let it = &l.lines[0].items[0];
         assert_eq!(it.font.as_deref(), Some("Courier New"));
         assert_eq!(it.color, Some(0xFF0000));
@@ -1303,7 +1444,7 @@ mod tests {
     fn aligned(text: &str, align: Align) -> Layout {
         let mut p = Paragraph::plain(text);
         p.align = align;
-        layout(&Document::from_paragraphs(vec![p]), SETUP, &m)
+        lay(&Document::from_paragraphs(vec![p]), SETUP, &m)
     }
 
     #[test]
@@ -1358,7 +1499,7 @@ mod tests {
 
         let mut p = Paragraph::plain("a b\nc d");
         p.align = Align::Justify;
-        let l = layout(&Document::from_paragraphs(vec![p]), SETUP, &m);
+        let l = lay(&Document::from_paragraphs(vec![p]), SETUP, &m);
         assert_eq!(
             l.lines[0].items[1].x,
             SETUP.left + 20.0,
@@ -1370,7 +1511,7 @@ mod tests {
     fn alignment_applies_inside_list_indent_and_table_cells() {
         let mut p = Paragraph::plain("ab").with_kind(Kind::Bullet);
         p.align = Align::Right;
-        let l = layout(&Document::from_paragraphs(vec![p]), SETUP, &m);
+        let l = lay(&Document::from_paragraphs(vec![p]), SETUP, &m);
         assert_eq!(l.lines[0].items[0].x + 20.0, SETUP.left + 100.0);
         assert!(
             l.lines[0].marker.as_ref().unwrap().x < SETUP.left + INDENT,
@@ -1379,7 +1520,7 @@ mod tests {
 
         let mut d = table_doc(&[&["ab", "cd"]]);
         d.paragraphs[1].align = Align::Right;
-        let l = layout(&d, WIDE, &m);
+        let l = lay(&d, WIDE, &m);
         let ab = l
             .lines
             .iter()
@@ -1398,15 +1539,17 @@ mod tests {
             right: 20.0,
             bottom: 50.0,
             left: 60.0,
+            header: 10.0,
+            footer: 10.0,
         };
         let d = doc(&["aaaaaaaaa bbbbbbbbbb cccccccccc"]); // 10px/char: 3 words of ~100px
-        let l = layout(&d, setup, &m);
+        let l = lay(&d, setup, &m);
         assert_eq!(l.lines[0].items[0].x, 60.0);
         assert_eq!(l.lines[0].y, 30.0);
         assert_eq!(l.lines[0].right, 280.0);
         assert_eq!(l.lines.len(), 2, "two words fit in 220px, the third wraps");
         let tall = doc(&vec!["x"; 40]);
-        let l = layout(&tall, setup, &m);
+        let l = lay(&tall, setup, &m);
         let last_on_p0 = l.lines.iter().rev().find(|l| l.page == 0).unwrap();
         assert!(
             last_on_p0.y + last_on_p0.height <= 400.0 - 50.0 + 0.01,
@@ -1419,18 +1562,18 @@ mod tests {
         let mut d = doc(&["ab"]);
         d.defaults.size = Some(30); // 15pt = 20px
         d.defaults.font = Some("Calibri".into());
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         let it = &l.lines[0].items[0];
         assert_eq!((it.size, it.font.as_deref()), (20.0, Some("Calibri")));
         assert!((l.lines[0].height - 20.0 * LINE_FACTOR).abs() < 1e-3);
         // An explicit run font wins; headings keep their own size.
         d.paragraphs[0].runs[0].format.font = Some("Courier New".into());
         assert_eq!(
-            layout(&d, SETUP, &m).lines[0].items[0].font.as_deref(),
+            lay(&d, SETUP, &m).lines[0].items[0].font.as_deref(),
             Some("Courier New")
         );
         d.paragraphs[0].kind = Kind::Heading(1);
-        assert_eq!(layout(&d, SETUP, &m).lines[0].items[0].size, hp_to_px(40));
+        assert_eq!(lay(&d, SETUP, &m).lines[0].items[0].size, hp_to_px(40));
     }
 
     #[test]
@@ -1439,7 +1582,7 @@ mod tests {
         d.paragraphs[0].space_after = Some(300); // 20px
         d.paragraphs[1].space_before = Some(150); // 10px
         d.paragraphs[1].space_after = Some(0);
-        let l = layout(&d, WIDE, &m);
+        let l = lay(&d, WIDE, &m);
         let ys: Vec<f32> = l.lines.iter().map(|l| l.y).collect();
         assert!(
             (ys[1] - ys[0] - (LH + 20.0 + 10.0)).abs() < 1e-3,
@@ -1449,7 +1592,7 @@ mod tests {
         // Space before is dropped at the very top of the page.
         let mut top = doc(&["a"]);
         top.paragraphs[0].space_before = Some(600);
-        assert_eq!(layout(&top, WIDE, &m).lines[0].y, WIDE.top);
+        assert_eq!(lay(&top, WIDE, &m).lines[0].y, WIDE.top);
     }
 
     #[test]
@@ -1457,7 +1600,7 @@ mod tests {
         let one = |l: Option<u16>| {
             let mut d = doc(&["aaaa bbbb cccc"]);
             d.paragraphs[0].line_spacing = l;
-            layout(&d, SETUP, &m).lines[0].height
+            lay(&d, SETUP, &m).lines[0].height
         };
         let (def, single, double) = (one(None), one(Some(240)), one(Some(480)));
         assert!(single < def, "Word single is tighter than Quill's default");
@@ -1469,7 +1612,7 @@ mod tests {
         // Text keeps its baseline; the extra space goes below it.
         let mut d = doc(&["ab"]);
         d.paragraphs[0].line_spacing = Some(480);
-        let line = &layout(&d, SETUP, &m).lines[0].clone();
+        let line = &lay(&d, SETUP, &m).lines[0].clone();
         assert_eq!(line.baseline, BASE_SIZE);
         assert!((line.height - line.baseline - line.descent).abs() < 1e-3);
     }
@@ -1478,27 +1621,27 @@ mod tests {
     fn indents_shift_and_narrow_the_text_area() {
         let mut d = doc(&["aaaa bbbb cccc"]);
         d.paragraphs[0].indent_left = Some(300); // 20px
-        let l = layout(&d, SETUP, &m); // 100px - 20px = 80px: one 4-char word + space per line? "aaaa bbbb" = 90 > 80
+        let l = lay(&d, SETUP, &m); // 100px - 20px = 80px: one 4-char word + space per line? "aaaa bbbb" = 90 > 80
         assert_eq!(l.lines[0].items[0].x, SETUP.left + 20.0);
         assert_eq!(l.lines.len(), 3);
 
         // First-line indent shifts only the first line.
         d.paragraphs[0].indent_left = None;
         d.paragraphs[0].indent_first = Some(150); // 10px
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         assert_eq!(l.lines[0].items[0].x, SETUP.left + 10.0);
         assert_eq!(l.lines[1].items[0].x, SETUP.left);
 
         // Hanging indent: first line sits left of the rest.
         d.paragraphs[0].indent_left = Some(450); // 30px
         d.paragraphs[0].indent_first = Some(-300); // hang 20px
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         assert_eq!(l.lines[0].items[0].x, SETUP.left + 10.0);
         assert_eq!(l.lines[1].items[0].x, SETUP.left + 30.0);
         // A hang larger than the indent is clamped to the container edge.
         d.paragraphs[0].indent_left = Some(150);
         d.paragraphs[0].indent_first = Some(-3000);
-        assert_eq!(layout(&d, SETUP, &m).lines[0].items[0].x, SETUP.left);
+        assert_eq!(lay(&d, SETUP, &m).lines[0].items[0].x, SETUP.left);
     }
 
     #[test]
@@ -1506,11 +1649,11 @@ mod tests {
         let mut d = doc(&["ab"]);
         d.paragraphs[0].indent_left = Some(300);
         d.paragraphs[0].align = Align::Right;
-        let l = layout(&d, SETUP, &m);
+        let l = lay(&d, SETUP, &m);
         assert_eq!(l.lines[0].items[0].x + 20.0, SETUP.left + 100.0);
         d.paragraphs[0].align = Align::Center;
         d.paragraphs[0].indent_first = Some(150);
-        let l = layout(&d, SETUP, &m); // area: 10px first-line indent + 20px left → centered in remaining 70px
+        let l = lay(&d, SETUP, &m); // area: 10px first-line indent + 20px left → centered in remaining 70px
         assert_eq!(
             l.lines[0].items[0].x,
             SETUP.left + 20.0 + 10.0 + (70.0 - 20.0) / 2.0
@@ -1527,8 +1670,8 @@ mod tests {
         for i in [1, 2] {
             d.paragraphs[i].space_after = Some(0);
         }
-        let tight = layout(&d, WIDE, &m);
-        let loose = layout(&table_doc(&[&["a"], &["b"]]), WIDE, &m);
+        let tight = lay(&d, WIDE, &m);
+        let loose = lay(&table_doc(&[&["a"], &["b"]]), WIDE, &m);
         assert!(
             (loose.cells[0].h - tight.cells[0].h - PARA_SPACING).abs() < 1e-3
                 || tight.cells[0].h <= loose.cells[0].h
@@ -1537,5 +1680,223 @@ mod tests {
             (tight.cells[0].h - (LH + 2.0 * CELL_PAD)).abs() < 1e-3,
             "no trailing space inside the cell"
         );
+    }
+
+    // 200 wide, 50 margins (100px text), header/footer 10px from the edges.
+    const HF: PageSetup = PageSetup {
+        width: 200.0,
+        height: 140.0,
+        top: 50.0,
+        right: 50.0,
+        bottom: 50.0,
+        left: 50.0,
+        header: 10.0,
+        footer: 10.0,
+    };
+
+    fn story_lines(l: &Layout, story: Story, page: usize) -> Vec<&Line> {
+        l.lines
+            .iter()
+            .filter(|x| x.story == story && x.page == page)
+            .collect()
+    }
+
+    fn with_footer(body: &[&str], footer: &str, align: Align) -> Document {
+        let mut d = doc(body);
+        let mut p = Paragraph::plain(footer);
+        p.align = align;
+        d.set_story_paras(Story::Footer, vec![p]);
+        d
+    }
+
+    #[test]
+    fn header_and_footer_repeat_on_every_page_at_their_distances() {
+        let mut d = doc(&["a", "b", "c", "d", "e", "f"]);
+        d.set_story_paras(Story::Header, vec![Paragraph::plain("head")]);
+        d.set_story_paras(Story::Footer, vec![Paragraph::plain("foot")]);
+        let l = layout(&d, HF, &m);
+        assert!(l.pages >= 2);
+        for page in 0..l.pages {
+            let h = story_lines(&l, Story::Header, page);
+            let f = story_lines(&l, Story::Footer, page);
+            assert_eq!((h.len(), f.len()), (1, 1), "page {page}");
+            assert_eq!(h[0].y, HF.header);
+            assert!(
+                (f[0].y + f[0].height - (HF.height - HF.footer)).abs() < 1e-3,
+                "footer sits on its margin"
+            );
+            assert_eq!(h[0].items[0].text, "head");
+            assert_eq!(h[0].items[0].x, HF.left);
+        }
+        // They don't take space from the body.
+        let body_only = lay(&d, HF, &m);
+        let plain = lay(&doc(&["a", "b", "c", "d", "e", "f"]), HF, &m);
+        assert_eq!(body_only.pages, plain.pages);
+    }
+
+    #[test]
+    fn empty_header_and_footer_still_have_clickable_lines() {
+        let l = layout(&doc(&["a"]), HF, &m);
+        assert_eq!(story_lines(&l, Story::Header, 0).len(), 1);
+        assert_eq!(story_lines(&l, Story::Footer, 0).len(), 1);
+        let mut focused = l.clone();
+        focused.focus = Focus {
+            story: Story::Footer,
+            page: 0,
+        };
+        let p = focused.hit_test(0, 70.0, HF.height - 12.0, &m);
+        assert_eq!(p, Pos::default());
+        assert_eq!(focused.caret(Pos::default(), &m).page, 0);
+    }
+
+    #[test]
+    fn page_number_fields_show_each_pages_number_and_the_total() {
+        let mut d = doc(&["a", "b", "c", "d", "e", "f"]);
+        let mut p = Paragraph::plain("");
+        p.runs.push(quill_core::Run::new(
+            format!("Page {PAGE_CHAR} of {}", quill_core::PAGES_CHAR),
+            Format::default(),
+        ));
+        d.set_story_paras(Story::Footer, vec![p]);
+        let l = layout(&d, HF, &m);
+        for page in 0..l.pages {
+            // The text may wrap at 10px per character; read every footer line.
+            let text: String = story_lines(&l, Story::Footer, page)
+                .iter()
+                .flat_map(|f| f.items.iter())
+                .map(|i| i.text.as_str())
+                .collect();
+            assert_eq!(
+                text,
+                format!("Page {} of {}", page + 1, l.pages),
+                "page {page}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_counts_as_one_character_for_offsets_and_carets() {
+        // Model text: "p" + PAGE + "q" → offsets 0..3, but the field shows "12".
+        let mut d = doc(&["body"]);
+        d.set_story_paras(
+            Story::Footer,
+            vec![Paragraph::plain(&format!("p{PAGE_CHAR}q"))],
+        );
+        let mut l = layout(&d, HF, &m);
+        l.focus = Focus {
+            story: Story::Footer,
+            page: 0,
+        };
+        let line = &story_lines(&l, Story::Footer, 0)[0].clone();
+        let field = line.items.iter().find(|i| i.atomic).unwrap();
+        assert_eq!((field.text.as_str(), field.start), ("1", 1));
+        let q = line.items.iter().find(|i| i.text == "q").unwrap();
+        assert_eq!(q.start, 2, "the field advanced the offset by exactly one");
+        let before = l.caret(Pos { para: 0, offset: 1 }, &m);
+        let after = l.caret(Pos { para: 0, offset: 2 }, &m);
+        assert_eq!(after.x - before.x, field.w);
+        // Clicking either half of the field puts the caret before or after it, never inside.
+        let y = before.y + 2.0;
+        assert_eq!(l.hit_test(0, before.x + 1.0, y, &m).offset, 1);
+        assert_eq!(l.hit_test(0, after.x - 1.0, y, &m).offset, 2);
+        let r = l.selection_rects(Pos { para: 0, offset: 1 }, Pos { para: 0, offset: 2 }, &m);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].w, field.w);
+    }
+
+    #[test]
+    fn lookups_follow_the_focused_story_and_page() {
+        let mut d = doc(&["a", "b", "c", "d", "e", "f"]);
+        d.set_story_paras(Story::Header, vec![Paragraph::plain("hdr")]);
+        let mut l = layout(&d, HF, &m);
+        assert!(l.pages >= 2);
+        // Same paragraph index and offset exist in body, and in the header on every page.
+        let pos = Pos { para: 0, offset: 1 };
+        l.focus = Focus {
+            story: Story::Body,
+            page: 0,
+        };
+        let body_caret = l.caret(pos, &m);
+        l.focus = Focus {
+            story: Story::Header,
+            page: 1,
+        };
+        let hdr_caret = l.caret(pos, &m);
+        assert_eq!((hdr_caret.page, hdr_caret.y), (1, HF.header));
+        assert_ne!(body_caret.y, hdr_caret.y);
+        // Hit-testing only considers the focused story.
+        let p = l.hit_test(1, 51.0, HF.header + 2.0, &m);
+        assert_eq!((p.para, p.offset), (0, 0));
+        l.focus = Focus {
+            story: Story::Body,
+            page: 0,
+        };
+        let body_hit = l.hit_test(0, 60.0, HF.header + 2.0, &m);
+        assert_eq!(
+            body_hit.para, 0,
+            "snaps to the nearest body line, not the header"
+        );
+        // Up/Down never leave the focused story.
+        l.focus = Focus {
+            story: Story::Header,
+            page: 0,
+        };
+        let up = l.vertical(Pos { para: 0, offset: 2 }, -1, 60.0, &m);
+        let down = l.vertical(Pos { para: 0, offset: 2 }, 1, 60.0, &m);
+        assert_eq!((up.para, down.para), (0, 0));
+        // Selection rectangles are only produced for the focused page.
+        let r = l.selection_rects(Pos { para: 0, offset: 0 }, Pos { para: 0, offset: 3 }, &m);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].page, 0);
+    }
+
+    #[test]
+    fn header_paragraphs_do_not_confuse_body_paragraph_boundaries() {
+        // A one-paragraph body whose header is also paragraph 0: the body's last line must
+        // still be recognised as the last line (justify leaves it alone; clicks may go to its end).
+        let mut d = doc(&["aaaa bbbb cccc"]);
+        d.paragraphs[0].align = Align::Justify;
+        d.set_story_paras(Story::Header, vec![Paragraph::plain("hdr")]);
+        let l = layout(&d, SETUP, &m);
+        let body: Vec<&Line> = l.lines.iter().filter(|x| x.story == Story::Body).collect();
+        assert_eq!(body.len(), 2);
+        assert_eq!(body[1].items[0].x, SETUP.left, "last line not justified");
+        let mut l = l.clone();
+        l.focus = Focus {
+            story: Story::Body,
+            page: 0,
+        };
+        assert_eq!(
+            l.line_range(Pos {
+                para: 0,
+                offset: 12
+            }),
+            (10, 14)
+        );
+    }
+
+    #[test]
+    fn footer_alignment_and_multiple_lines_stack_upward() {
+        let mut d = with_footer(&["a"], "f1", Align::Center);
+        d.set_story_paras(
+            Story::Footer,
+            vec![
+                {
+                    let mut p = Paragraph::plain("one");
+                    p.align = Align::Center;
+                    p
+                },
+                Paragraph::plain("two"),
+            ],
+        );
+        let l = layout(&d, HF, &m);
+        let f = story_lines(&l, Story::Footer, 0);
+        assert_eq!(f.len(), 2);
+        assert!(f[1].y > f[0].y, "paragraphs run top to bottom");
+        assert!(
+            (f[1].y + f[1].height - (HF.height - HF.footer)).abs() < 1e-3,
+            "last line on the margin"
+        );
+        assert_eq!(f[0].items[0].x, HF.left + 35.0, "centred: (100 - 30) / 2");
     }
 }

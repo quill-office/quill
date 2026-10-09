@@ -5,9 +5,9 @@
 //! by canvas `measureText`, so layout matches what the browser draws.
 
 use js_sys::Function;
-use quill_core::{Align, Attr, Kind, Page, Pos};
+use quill_core::{Align, Attr, Kind, Page, Pos, Story, PAGES_CHAR, PAGE_CHAR};
 use quill_layout::{
-    base_size, layout, para_size, Caret, Layout, Measure, PageSetup, Rect, TextStyle,
+    base_size, layout, para_size, Caret, Focus, Layout, Measure, PageSetup, Rect, TextStyle,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -55,12 +55,17 @@ struct State {
     line_spacing: u16,
     indent: u16,
     paper: &'static str,
+    /// Which story is being edited: "body", "header" or "footer".
+    story: &'static str,
 }
 
 #[derive(Serialize)]
 struct PageBox {
     w: f32,
     h: f32,
+    /// Top and bottom margins, where headers and footers live.
+    top: f32,
+    bottom: f32,
 }
 
 #[derive(Serialize)]
@@ -102,6 +107,8 @@ pub struct Editor {
     measure: Option<Function>,
     /// Horizontal target kept across consecutive Up/Down presses.
     goal_x: Option<f32>,
+    /// Page where the header/footer caret is shown (they repeat on every page).
+    focus_page: usize,
 }
 
 #[wasm_bindgen]
@@ -112,6 +119,7 @@ impl Editor {
             inner: quill_core::Editor::default(),
             measure: None,
             goal_x: None,
+            focus_page: 0,
         }
     }
 
@@ -147,7 +155,12 @@ impl Editor {
             .clone()
             .ok_or_else(|| JsError::new("set_measure must be called first"))?;
         let page = PageSetup::from_page(&self.inner.doc().page);
-        Ok((layout(self.inner.doc(), page, &JsMeasure(&f)), f))
+        let mut l = layout(self.inner.doc(), page, &JsMeasure(&f));
+        l.focus = Focus {
+            story: self.inner.story(),
+            page: self.focus_page,
+        };
+        Ok((l, f))
     }
 
     // ---- files / text ----------------------------------------------------
@@ -283,6 +296,37 @@ impl Editor {
         Ok(())
     }
 
+    /// Edit the "body", "header" or "footer". Headers and footers repeat on
+    /// every page, so `page` says where the caret is drawn.
+    pub fn enter_story(&mut self, story: &str, page: usize) -> Result<(), JsError> {
+        let story = match story {
+            "body" => Story::Body,
+            "header" => Story::Header,
+            "footer" => Story::Footer,
+            other => return Err(JsError::new(&format!("unknown story: {other}"))),
+        };
+        self.goal_x = None;
+        self.focus_page = page;
+        self.inner.enter_story(story);
+        Ok(())
+    }
+
+    /// Insert a "page" or "pages" (page count) field; headers and footers only.
+    pub fn insert_field(&mut self, kind: &str) -> Result<(), JsError> {
+        self.goal_x = None;
+        self.inner.insert_field(match kind {
+            "page" => PAGE_CHAR,
+            "pages" => PAGES_CHAR,
+            other => return Err(JsError::new(&format!("unknown field: {other}"))),
+        });
+        Ok(())
+    }
+
+    /// Give the document a centred page-number footer.
+    pub fn add_page_numbers(&mut self) {
+        self.inner.add_page_numbers();
+    }
+
     /// Insert an inline image at the caret. `width`/`height` are the display
     /// size in px. Supported types: PNG, JPEG, GIF, WebP, BMP.
     pub fn insert_image(
@@ -365,6 +409,20 @@ impl Editor {
         extend: bool,
         clicks: u32,
     ) -> Result<(), JsError> {
+        // The page margins are where headers and footers are edited: a
+        // double-click there enters them; a click in the text area leaves them.
+        let setup = PageSetup::from_page(&self.inner.doc().page);
+        let region = if y < setup.top {
+            Story::Header
+        } else if y > setup.height - setup.bottom {
+            Story::Footer
+        } else {
+            Story::Body
+        };
+        if region != self.inner.story() && (clicks >= 2 || region == Story::Body) {
+            self.inner.enter_story(region);
+        }
+        self.focus_page = page;
         let (l, f) = self.layout()?;
         let pos = l.hit_test(page, x, y, &JsMeasure(&f));
         self.goal_x = None;
@@ -469,6 +527,11 @@ impl Editor {
                 },
                 line_spacing: self.inner.current_paragraph().line_spacing.unwrap_or(0),
                 indent: self.inner.current_paragraph().indent_left.unwrap_or(0),
+                story: match self.inner.story() {
+                    Story::Body => "body",
+                    Story::Header => "header",
+                    Story::Footer => "footer",
+                },
                 paper: match self.inner.doc().page {
                     p if (p.width, p.height) == (Page::LETTER.width, Page::LETTER.height) => {
                         "letter"
@@ -483,6 +546,8 @@ impl Editor {
                 PageBox {
                     w: p.width,
                     h: p.height,
+                    top: p.top,
+                    bottom: p.bottom,
                 }
             },
             layout: &l,

@@ -37,6 +37,31 @@ pub struct Format {
 /// Placeholder character standing for one inline image in paragraph text.
 pub const OBJECT_CHAR: char = '\u{FFFC}';
 
+/// Field placeholders (private-use characters). Only headers and footers
+/// hold them; layout shows each page's number in their place.
+pub const PAGE_CHAR: char = '\u{E001}';
+pub const PAGES_CHAR: char = '\u{E002}';
+
+/// Whether `c` is a page-number field placeholder.
+pub fn is_field_char(c: char) -> bool {
+    c == PAGE_CHAR || c == PAGES_CHAR
+}
+
+/// A separately edited stream of paragraphs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Story {
+    #[default]
+    Body,
+    Header,
+    Footer,
+}
+
+impl Story {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
 static NEXT_UID: AtomicU64 = AtomicU64::new(1);
 
 /// An embedded raster image. `width`/`height` are the display size in CSS px.
@@ -102,6 +127,9 @@ pub struct Page {
     pub right: u32,
     pub bottom: u32,
     pub left: u32,
+    /// Distance from the page edge to the header/footer text.
+    pub header: u32,
+    pub footer: u32,
 }
 
 impl Page {
@@ -117,6 +145,8 @@ impl Page {
             right: 1440,
             bottom: 1440,
             left: 1440,
+            header: 720,
+            footer: 720,
         }
     }
 
@@ -339,7 +369,13 @@ pub struct Pos {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Document {
+    /// The paragraphs of the story being edited (`story`). The other
+    /// stories are parked in `stashed`; use `story_paras` to read any of them.
     pub paragraphs: Vec<Paragraph>,
+    #[serde(default)]
+    pub story: Story,
+    #[serde(default)]
+    stashed: [Vec<Paragraph>; 3],
     #[serde(default)]
     pub images: Vec<Image>,
     #[serde(default)]
@@ -352,6 +388,8 @@ impl Default for Document {
     fn default() -> Self {
         Self {
             paragraphs: vec![Paragraph::default()],
+            story: Story::Body,
+            stashed: Default::default(),
             images: vec![],
             page: Page::default(),
             defaults: Defaults::default(),
@@ -390,14 +428,57 @@ impl Document {
         }
         Self {
             paragraphs,
+            story: Story::Body,
+            stashed: Default::default(),
             images: vec![],
             page: Page::default(),
             defaults: Defaults::default(),
         }
     }
 
+    /// The paragraphs of `story`, whether or not it is the one being edited.
+    pub fn story_paras(&self, story: Story) -> &[Paragraph] {
+        if story == self.story {
+            &self.paragraphs
+        } else {
+            &self.stashed[story.index()]
+        }
+    }
+
+    /// Start editing `story`. Header and footer always hold at least one paragraph.
+    pub fn switch_story(&mut self, story: Story) {
+        if story == self.story {
+            return;
+        }
+        self.stashed[self.story.index()] = std::mem::take(&mut self.paragraphs);
+        self.paragraphs = std::mem::take(&mut self.stashed[story.index()]);
+        if self.paragraphs.is_empty() {
+            self.paragraphs.push(Paragraph::default());
+        }
+        self.story = story;
+    }
+
+    /// Replace the paragraphs of a story (which may be the active one).
+    pub fn set_story_paras(&mut self, story: Story, paras: Vec<Paragraph>) {
+        let mut paras = paras;
+        if paras.is_empty() {
+            paras.push(Paragraph::default());
+        }
+        if story == self.story {
+            self.paragraphs = paras;
+        } else {
+            self.stashed[story.index()] = paras;
+        }
+    }
+
+    /// Whether a story has any text, fields or images.
+    pub fn story_has_content(&self, story: Story) -> bool {
+        self.story_paras(story).iter().any(|p| !p.is_empty())
+    }
+
+    /// Body text only, regardless of which story is being edited.
     pub fn plain_text(&self) -> String {
-        self.paragraphs
+        self.story_paras(Story::Body)
             .iter()
             .map(Paragraph::text)
             .collect::<Vec<_>>()
