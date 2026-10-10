@@ -41,6 +41,14 @@ npm run build    # produces an installable bundle in desktop/src-tauri/target/re
 Requires Rust, Node 18+, and the platform's Tauri prerequisites (Xcode command-line tools on macOS).
 The desktop crate is not part of the Cargo workspace, so `cargo test --workspace` doesn't need Tauri.
 
+### Releases
+
+Pushing a tag such as `v0.1.0` runs `.github/workflows/release.yml`, which builds installers for macOS (Apple
+silicon and Intel), Windows and Linux and attaches them to a **draft** GitHub release for you to review and publish.
+The builds are **unsigned**: macOS Gatekeeper and Windows SmartScreen will warn on first launch (on macOS,
+right-click → Open). Signing needs an Apple Developer ID / a Windows certificate and repository secrets; it isn't
+set up yet.
+
 ## Status: phase 9
 
 Works: typing, selection (mouse drag, Shift+arrows, double/triple-click, Select All), cut/copy/paste,

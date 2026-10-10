@@ -1,0 +1,79 @@
+name: Release
+
+# Push a tag like v0.1.0 to build installers for macOS, Windows and Linux.
+# They are attached to a *draft* GitHub release; nothing is published until
+# you review and publish that draft. Builds are unsigned (see README).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            args: "--target aarch64-apple-darwin"
+          - os: macos-15-intel
+            args: "--target x86_64-apple-darwin"
+          - os: ubuntu-22.04
+            args: ""
+          - os: windows-latest
+            args: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown${{ matrix.os == 'macos-latest' && ',aarch64-apple-darwin' || '' }}${{ matrix.os == 'macos-15-intel' && ',x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> target
+
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: Install wasm-bindgen CLI (the version the code was built against)
+        shell: bash
+        run: |
+          version="$(cargo metadata --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="wasm-bindgen"))')"
+          cargo install wasm-bindgen-cli --locked --version "$version"
+
+      - name: Build the WebAssembly package
+        shell: bash
+        run: ./build.sh
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: "Quill Write ${{ github.ref_name }}"
+          releaseBody: "Unsigned builds. See the README for first-launch notes."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
