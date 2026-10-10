@@ -236,6 +236,19 @@ impl Editor {
         self.goal_x = None;
     }
 
+    /// Start an empty document (history cleared).
+    pub fn new_document(&mut self) {
+        self.inner.load(quill_core::Document::default());
+        self.goal_x = None;
+        self.focus_page = 0;
+    }
+
+    /// Changes whenever the document does; compare with a value saved at
+    /// save time to know whether there are unsaved changes.
+    pub fn revision(&self) -> u32 {
+        self.inner.revision() as u32
+    }
+
     pub fn save_docx(&self) -> Result<Vec<u8>, JsError> {
         quill_docx::write(self.inner.doc()).map_err(|e| JsError::new(&e.to_string()))
     }

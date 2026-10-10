@@ -42,6 +42,9 @@ pub struct Editor {
     last: Option<Action>,
     /// Where the caret was in each story when it was last left.
     saved: [Pos; 3],
+    /// Bumped by every edit, undo and redo; lets a host tell whether the
+    /// document changed since it was saved.
+    revision: u64,
 }
 
 impl Default for Editor {
@@ -61,6 +64,7 @@ impl Editor {
             redo: vec![],
             last: None,
             saved: [Pos::default(); 3],
+            revision: 0,
         }
     }
 
@@ -94,6 +98,11 @@ impl Editor {
             .chars()
             .filter(|&c| c != OBJECT_CHAR && !is_field_char(c))
             .collect()
+    }
+
+    /// Changes whenever the document does (edits, undo, redo).
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn can_undo(&self) -> bool {
@@ -186,6 +195,7 @@ impl Editor {
         match snap {
             Some(s) => {
                 if s.doc != self.doc {
+                    self.revision += 1;
                     self.undo.push(s);
                     if self.undo.len() > MAX_HISTORY {
                         self.undo.remove(0);
@@ -194,7 +204,10 @@ impl Editor {
                     self.last = Some(action);
                 }
             }
-            None => self.redo.clear(),
+            None => {
+                self.revision += 1;
+                self.redo.clear();
+            }
         }
     }
 
@@ -203,6 +216,7 @@ impl Editor {
             let cur = self.snapshot();
             self.redo.push(cur);
             self.restore(prev);
+            self.revision += 1;
         }
     }
 
@@ -211,6 +225,7 @@ impl Editor {
             let cur = self.snapshot();
             self.undo.push(cur);
             self.restore(next);
+            self.revision += 1;
         }
     }
 
@@ -1478,5 +1493,33 @@ mod tests {
         assert_eq!(e.doc().find_all("head", o).len(), 0);
         e.insert_text("head");
         assert_eq!(e.doc().find_all("head", o).len(), 1);
+    }
+
+    #[test]
+    fn revision_tracks_changes_but_not_cursor_moves_or_no_ops() {
+        let mut e = Editor::default();
+        let r0 = e.revision();
+        e.set_cursor(Pos::default(), false);
+        e.select_all();
+        e.backspace(); // nothing to delete
+        assert_eq!(e.revision(), r0, "moves and no-op edits don't count");
+        e.insert_text("a");
+        let r1 = e.revision();
+        assert!(r1 > r0);
+        e.insert_text("b"); // coalesced typing still counts
+        assert!(e.revision() > r1);
+        let r2 = e.revision();
+        e.undo();
+        assert!(e.revision() > r2);
+        let r3 = e.revision();
+        e.redo();
+        assert!(e.revision() > r3);
+        e.undo();
+        e.undo(); // nothing left to undo
+        let r4 = e.revision();
+        e.undo();
+        assert_eq!(e.revision(), r4);
+        e.load(Document::default());
+        assert_eq!(e.revision(), 0, "loading starts afresh");
     }
 }

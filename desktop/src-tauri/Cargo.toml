@@ -1,0 +1,26 @@
+[package]
+name = "quill-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Desktop shell for Quill Write"
+
+# Not part of the main workspace: building it needs the Tauri toolchain.
+[workspace]
+
+[lib]
+name = "quill_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

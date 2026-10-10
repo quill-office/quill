@@ -1,0 +1,15 @@
+{
+  "name": "quill-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Desktop shell for Quill Write (Tauri)",
+  "scripts": {
+    "wasm": "bash ../build.sh",
+    "dev": "npm run wasm && tauri dev",
+    "build": "npm run wasm && tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.1"
+  }
+}

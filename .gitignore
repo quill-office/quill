@@ -2,3 +2,5 @@
 /web/pkg
 node_modules
 .DS_Store
+/desktop/src-tauri/target
+/desktop/src-tauri/gen

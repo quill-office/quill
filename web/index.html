@@ -37,9 +37,10 @@
 <body>
 <header role="toolbar" aria-label="Formatting">
   <strong>Quill Write</strong>
-  <button id="open" title="Open .docx">Open</button>
+  <button id="new" title="New document">New</button>
+  <button id="open" title="Open a .docx (Ctrl+O)">Open</button>
   <button id="find" title="Find and replace (Ctrl+F)">🔍 Find</button>
-  <button id="save" title="Save as .docx">Save</button>
+  <button id="save" title="Save as .docx (Ctrl+S; Ctrl+Shift+S to save as)">Save</button>
   <button id="pdf" title="Export as PDF">PDF</button>
   <span class="sep"></span>
   <button id="undo" title="Undo (Ctrl+Z)" aria-label="Undo">↶</button>
@@ -114,7 +115,6 @@
     <button id="replaceAll" title="Replace every match">Replace all</button>
     <button id="findClose" title="Close (Esc)" aria-label="Close find">✕</button>
   </div>
-  <input id="file" type="file" accept=".docx" hidden>
   <input id="imageFile" type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/bmp" hidden>
 </header>
 <div id="pages"></div>

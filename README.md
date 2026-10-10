@@ -13,6 +13,7 @@ An open-source, cross-platform office suite. Written in Rust, compiled to WebAss
 | `quill-pdf` | PDF writer driven by the layout (standard fonts, embedded images) |
 | `quill-wasm` | `wasm-bindgen` bindings (`Editor`) |
 | `web/` | Canvas-based editor shell (no framework) |
+| `desktop/` | Tauri 2 desktop app that wraps `web/` with native file dialogs |
 
 ## Run
 
@@ -23,6 +24,22 @@ cargo install wasm-bindgen-cli --locked
 python3 -m http.server -d web 8080   # open http://localhost:8080
 cargo test --workspace
 ```
+
+## Desktop app
+
+`desktop/` wraps the web editor in a native window (Tauri 2) with real Open / Save / Save As / PDF dialogs,
+an unsaved-changes marker in the title bar, and a confirmation before closing with unsaved changes. The page never
+sees file paths: Rust commands show the dialog and read or write only the file the user picked.
+
+```sh
+cd desktop
+npm install
+npm run dev      # builds the WASM package, then opens the app
+npm run build    # produces an installable bundle in desktop/src-tauri/target/release/bundle
+```
+
+Requires Rust, Node 18+, and the platform's Tauri prerequisites (Xcode command-line tools on macOS).
+The desktop crate is not part of the Cargo workspace, so `cargo test --workspace` doesn't need Tauri.
 
 ## Status: phase 9
 
@@ -49,7 +66,7 @@ Not yet: regular-expression and formatting search, searching all stories at once
 multiple sections, different first-page and odd/even headers, pictures and tables in headers/footers,
 other fields (date, title, …), exact/at-least line spacing, right indents, headers/footers, page-break control
 (widows/orphans), word-wise caret movement (Alt/Ctrl+arrows), find/replace, rich clipboard (HTML),
-real-time collaboration, desktop (Tauri) shell. Undo is snapshot-based; it will become an operation log
+real-time collaboration, file associations and "open with" from the OS, auto-update, code signing, mobile. Undo is snapshot-based; it will become an operation log
 when collaboration lands.
 
 ## License

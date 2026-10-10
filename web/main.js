@@ -1,4 +1,5 @@
 import init, { Editor } from "./pkg/quill_wasm.js";
+import { files } from "./files.js";
 
 const FONT_FAMILY = "Georgia, 'Times New Roman', serif";
 // Office documents name fonts that browsers often lack; fall back by style.
@@ -186,6 +187,7 @@ function updateToolbar() {
   sel.value = ["normal", "h1", "h2", "h3"].includes(s.kind) ? s.kind : "normal";
   const inHf = s.story !== "body";
   updateFindCount();
+  updateTitle();
   $("hfTools").hidden = !inHf;
   $("editHeader").setAttribute("aria-pressed", String(s.story === "header"));
   $("editFooter").setAttribute("aria-pressed", String(s.story === "footer"));
@@ -468,18 +470,61 @@ document.addEventListener("keydown", (e) => {
   if (k === "f" || k === "h") { e.preventDefault(); openFind(k === "h"); }
 });
 
-const file = $("file");
-$("open").onclick = () => file.click();
-file.onchange = async () => {
-  const f = file.files[0];
-  if (!f) return;
-  try { editor.open_docx(new Uint8Array(await f.arrayBuffer())); }
-  catch (err) { alert(`Could not open ${f.name}: ${err.message ?? err}`); }
-  file.value = "";
-  ime.focus();
-  window.scrollTo(0, 0);
-  refresh({ scroll: false });
-};
+// ---- documents: new / open / save ------------------------------------------
+
+let currentName = null;      // file name of the open document, if it has one
+let savedRevision = 0;       // editor revision at the last save/open
+const isDirty = () => editor.revision() !== savedRevision;
+let shownTitle = "";
+function updateTitle() {
+  const title = `${isDirty() ? "• " : ""}${currentName ?? "Untitled"} — Quill Write`;
+  if (title !== shownTitle) { shownTitle = title; files.setTitle(title).catch(() => {}); }
+}
+function markClean() { savedRevision = editor.revision(); updateTitle(); }
+const afterLoad = () => { ime.focus(); window.scrollTo(0, 0); refresh({ scroll: false }); };
+
+async function newFlow() {
+  if (isDirty() && !(await files.confirmDiscard())) return;
+  editor.new_document();
+  currentName = null;
+  await files.forget();
+  markClean();
+  afterLoad();
+}
+
+async function openFlow() {
+  if (isDirty() && !(await files.confirmDiscard())) return;
+  let picked;
+  try { picked = await files.open(); }
+  catch (err) { alert(`Could not open the file: ${err?.message ?? err}`); return; }
+  if (!picked) return;
+  try { editor.open_docx(picked.bytes); }
+  catch (err) { alert(`Could not open ${picked.name}: ${err.message ?? err}`); return; }
+  currentName = picked.name;
+  markClean();
+  afterLoad();
+}
+
+async function saveFlow(saveAs = false) {
+  try {
+    const name = await files.saveDocx(editor.save_docx(), { saveAs, name: currentName });
+    if (name) { currentName = name; markClean(); }
+  } catch (err) {
+    alert(`Could not save: ${err?.message ?? err}`);
+  }
+}
+
+$("new").onclick = newFlow;
+$("open").onclick = openFlow;
+$("save").onclick = () => saveFlow(false);
+document.addEventListener("keydown", (e) => {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === "s") { e.preventDefault(); saveFlow(e.shiftKey); }
+  else if (k === "o") { e.preventDefault(); openFlow(); }
+});
+// Closing with unsaved changes asks first (natively in the app; the browser shows its own prompt).
+files.onCloseRequest(Object.assign(async () => !isDirty() || (await files.confirmDiscard()), { sync: () => !isDirty() }));
 const MAX_PDF_IMAGE = 1600; // px on the long side; keeps the PDF reasonable
 async function decodeForPdf(id) {
   const blob = new Blob([editor.image_data(id)], { type: editor.image_mime(id) });
@@ -500,22 +545,14 @@ $("pdf").onclick = async () => {
       try { const img = await decodeForPdf(id); editor.set_pdf_image(id, img.w, img.h, img.rgba); }
       catch (err) { console.warn(`Skipping image ${id} in the PDF:`, err); }
     }
-    const blob = new Blob([editor.export_pdf("document")], { type: "application/pdf" });
-    const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: "document.pdf" });
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    await files.savePdf(editor.export_pdf(currentName ?? "document"), { name: currentName });
   } catch (err) {
     alert(`Could not create the PDF: ${err.message ?? err}`);
   } finally {
     $("pdf").disabled = false;
   }
 };
-$("save").onclick = () => {
-  const blob = new Blob([editor.save_docx()], { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
-  const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: "document.docx" });
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-};
 
 ime.focus();
 refresh({ scroll: false });
+files.ready().catch(() => {});
