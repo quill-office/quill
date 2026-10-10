@@ -10,6 +10,7 @@ An open-source, cross-platform office suite. Written in Rust, compiled to WebAss
 | `quill-core` | Document model and editing operations |
 | `quill-layout` | Line breaking, caret positioning, hit testing (measurement is injected) |
 | `quill-docx` | `.docx` (OOXML) import/export |
+| `quill-pdf` | PDF writer driven by the layout (standard fonts, embedded images) |
 | `quill-wasm` | `wasm-bindgen` bindings (`Editor`) |
 | `web/` | Canvas-based editor shell (no framework) |
 
@@ -23,7 +24,7 @@ python3 -m http.server -d web 8080   # open http://localhost:8080
 cargo test --workspace
 ```
 
-## Status: phase 8
+## Status: phase 9
 
 Works: typing, selection (mouse drag, Shift+arrows, double/triple-click, Select All), cut/copy/paste,
 undo/redo (typing bursts coalesce), bold/italic/underline (also for upcoming typing), Heading 1–3,
@@ -34,10 +35,15 @@ line breaks included), inline images (insert, paste, drag-and-drop, resize, save
 font family, size and colour per character, paragraph alignment (left, centre, right, justify), and mixed
 sizes on one line; paragraph spacing, line spacing and indents; paper sizes (Letter, A4, Legal) and page margins; headers and footers with page-number and page-count
 fields (double-click the top or bottom margin, or use the Page no. button), saved to and read from `.docx`; find and replace (case and whole-word options, live highlighting,
-replace all as one undo step).
+replace all as one undo step); PDF export.
 
 `.docx` import resolves Word's styling: document defaults, theme fonts, paragraph and character styles with
 `basedOn` inheritance, table-style paragraph properties, and the section's page size and margins.
+
+PDF export lays the document out again with Arial / Times New Roman / Courier New (metric-compatible with the
+PDF standard fonts Helvetica / Times / Courier), so nothing needs embedding but line breaks can differ slightly from
+the screen, and only Western-European (WinAnsi) characters are supported; others print as `?`. No links,
+bookmarks or tagged (accessible) structure yet.
 
 Not yet: regular-expression and formatting search, searching all stories at once, floating/wrapped images, drag-resize handles, SVG/EMF images, merged table cells, column resizing, nested tables, highlight/strikethrough/super- and subscript, nested lists, conditional table formatting (banded rows etc.),
 multiple sections, different first-page and odd/even headers, pictures and tables in headers/footers,

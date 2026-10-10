@@ -4,6 +4,8 @@
 //! The host calls `set_measure(fn(text, bold, italic, size) -> width)`, backed
 //! by canvas `measureText`, so layout matches what the browser draws.
 
+use std::collections::HashMap;
+
 use js_sys::Function;
 use quill_core::{
     Align, Attr, FindDir, FindOptions, Kind, Page, Pos, Story, PAGES_CHAR, PAGE_CHAR,
@@ -13,6 +15,23 @@ use quill_layout::{
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
+
+/// Measures with the metric-compatible families the PDF's standard fonts
+/// match, so layout widths equal the widths in the PDF.
+struct PdfMeasure<'a>(&'a Function);
+
+impl Measure for PdfMeasure<'_> {
+    fn width(&self, text: &str, s: &TextStyle) -> f32 {
+        let family = quill_pdf::Family::of(s.font.as_deref());
+        JsMeasure(self.0).width(
+            text,
+            &TextStyle {
+                font: Some(family.css().into()),
+                ..s.clone()
+            },
+        )
+    }
+}
 
 struct JsMeasure<'a>(&'a Function);
 
@@ -122,6 +141,8 @@ pub struct Editor {
     focus_page: usize,
     /// The active search, if any.
     find: Option<(String, FindOptions)>,
+    /// Decoded images supplied for the next PDF export.
+    pdf_images: HashMap<u32, quill_pdf::PdfImage>,
 }
 
 #[wasm_bindgen]
@@ -134,6 +155,7 @@ impl Editor {
             goal_x: None,
             focus_page: 0,
             find: None,
+            pdf_images: HashMap::new(),
         }
     }
 
@@ -339,6 +361,68 @@ impl Editor {
     /// Give the document a centred page-number footer.
     pub fn add_page_numbers(&mut self) {
         self.inner.add_page_numbers();
+    }
+
+    // ---- PDF export ----------------------------------------------------------
+
+    /// Ids of the body's images. Decode each in the host and pass its pixels
+    /// to `set_pdf_image` before calling `export_pdf`.
+    pub fn pdf_image_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for p in self.inner.doc().story_paras(Story::Body) {
+            for id in p.runs.iter().filter_map(|r| r.format.image) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
+    /// Supply decoded 8-bit RGBA pixels for an image.
+    pub fn set_pdf_image(
+        &mut self,
+        id: u32,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<(), JsError> {
+        if (width as usize) * (height as usize) * 4 != rgba.len() {
+            return Err(JsError::new("pixel data does not match the image size"));
+        }
+        self.pdf_images.insert(
+            id,
+            quill_pdf::PdfImage {
+                width,
+                height,
+                rgba: rgba.to_vec(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Render the document as a PDF. Text uses the standard PDF fonts and is
+    /// laid out with metric-compatible fonts, so line breaks can differ
+    /// slightly from the on-screen layout.
+    pub fn export_pdf(&mut self, title: &str) -> Result<Vec<u8>, JsError> {
+        let f = self
+            .measure
+            .clone()
+            .ok_or_else(|| JsError::new("set_measure must be called first"))?;
+        let page = PageSetup::from_page(&self.inner.doc().page);
+        let l = layout(self.inner.doc(), page, &PdfMeasure(&f));
+        let pdf = quill_pdf::render(
+            &l,
+            page.width,
+            page.height,
+            &self.pdf_images,
+            &quill_pdf::Options {
+                title: title.to_owned(),
+                compress: true,
+            },
+        );
+        self.pdf_images.clear();
+        Ok(pdf)
     }
 
     // ---- find and replace ------------------------------------------------

@@ -480,6 +480,36 @@ file.onchange = async () => {
   window.scrollTo(0, 0);
   refresh({ scroll: false });
 };
+const MAX_PDF_IMAGE = 1600; // px on the long side; keeps the PDF reasonable
+async function decodeForPdf(id) {
+  const blob = new Blob([editor.image_data(id)], { type: editor.image_mime(id) });
+  const bitmap = await createImageBitmap(blob);
+  const scale = Math.min(1, MAX_PDF_IMAGE / Math.max(bitmap.width, bitmap.height));
+  const [w, h] = [Math.max(1, Math.round(bitmap.width * scale)), Math.max(1, Math.round(bitmap.height * scale))];
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const g = c.getContext("2d");
+  g.drawImage(bitmap, 0, 0, w, h);
+  bitmap.close();
+  return { w, h, rgba: new Uint8Array(g.getImageData(0, 0, w, h).data.buffer) };
+}
+$("pdf").onclick = async () => {
+  $("pdf").disabled = true;
+  try {
+    for (const id of editor.pdf_image_ids()) {
+      try { const img = await decodeForPdf(id); editor.set_pdf_image(id, img.w, img.h, img.rgba); }
+      catch (err) { console.warn(`Skipping image ${id} in the PDF:`, err); }
+    }
+    const blob = new Blob([editor.export_pdf("document")], { type: "application/pdf" });
+    const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: "document.pdf" });
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  } catch (err) {
+    alert(`Could not create the PDF: ${err.message ?? err}`);
+  } finally {
+    $("pdf").disabled = false;
+  }
+};
 $("save").onclick = () => {
   const blob = new Blob([editor.save_docx()], { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
   const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: "document.docx" });
