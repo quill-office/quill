@@ -10,9 +10,11 @@ An open-source, cross-platform office suite. Written in Rust, compiled to WebAss
 | `quill-core` | Document model and editing operations |
 | `quill-layout` | Line breaking, caret positioning, hit testing (measurement is injected) |
 | `quill-docx` | `.docx` (OOXML) import/export |
+| `quill-calc` | Spreadsheet engine: sparse grid, formulas, recalculation, CSV |
+| `quill-sheets-wasm` | WebAssembly bindings for the spreadsheet engine |
 | `quill-pdf` | PDF writer driven by the layout (standard fonts, embedded images) |
 | `quill-wasm` | `wasm-bindgen` bindings (`Editor`) |
-| `web/` | Canvas-based editor shell (no framework) |
+| `web/` | Canvas-based editor shell (no framework); `web/sheets/` is the spreadsheet app |
 | `desktop/` | Tauri 2 desktop app that wraps `web/` with native file dialogs |
 
 ## Run
@@ -24,6 +26,30 @@ cargo install wasm-bindgen-cli --locked
 python3 -m http.server -d web 8080   # open http://localhost:8080
 cargo test --workspace
 ```
+
+## Quill Sheets
+
+A spreadsheet at `web/sheets/` (open it from the *Sheets* link in Quill Write, or serve `web/` and visit
+`/sheets/`). It shares the build and design with Write but is its own app and engine (`quill-calc`).
+
+- **Formulas:** operators with Excel's precedence (`-2^2` is 4), ranges (`A1:B3`, `A:A`, `2:4`), `$` absolute
+  references, errors (`#DIV/0!`, `#REF!`, `#NAME?`, `#VALUE!`, `#N/A`, `#NUM!`, `#CIRC!`), and about 60 functions:
+  `SUM AVERAGE MIN MAX COUNT COUNTA COUNTBLANK PRODUCT MEDIAN`, `ROUND* INT MOD POWER SQRT ABS …`,
+  `IF IFERROR IFNA AND OR NOT`, `LEN LEFT RIGHT MID TRIM UPPER LOWER CONCAT TEXTJOIN SUBSTITUTE FIND SEARCH …`,
+  `SUMIF COUNTIF AVERAGEIF` (with `>5`, `<>x`, `ap*` criteria), `VLOOKUP HLOOKUP MATCH INDEX`, and the `IS…` tests.
+- **Recalculation** follows dependencies lazily, detects circular references, and handles forward references.
+- **Editing:** type to replace, F2 or double-click to edit, formula bar and name box, Tab/Enter movement,
+  Ctrl+Arrow, Shift selection, whole-row/column selection, drag to resize (double-click a border to fit),
+  copy/cut/paste (formulas shift their relative references; text from other apps is typed in), fill down/right,
+  insert/delete rows and columns (formulas are rewritten), undo/redo.
+- **Formatting:** bold, italic, alignment, text and fill colour, number formats (number, integer, percent, currency,
+  decimals). Typing `12%` or `$5` picks the matching format.
+- **Files:** CSV open/save (comma, semicolon or tab; quoted fields; formulas in CSV are evaluated; exported text that
+  starts with `=` or `@` is prefixed with `'`).
+
+Not yet in Sheets: `.xlsx` files, multiple sheets and `Sheet2!A1` references, dates and times, charts, sorting and
+filtering, freezing panes, merged cells, conditional formatting, and pointing at cells with the mouse while typing a
+formula. The desktop shell does not host Sheets yet.
 
 ## Desktop app
 
@@ -49,7 +75,7 @@ The builds are **unsigned**: macOS Gatekeeper and Windows SmartScreen will warn 
 right-click → Open). Signing needs an Apple Developer ID / a Windows certificate and repository secrets; it isn't
 set up yet.
 
-## Status: phase 9
+## Status: phase 10
 
 Works: typing, selection (mouse drag, Shift+arrows, double/triple-click, Select All), cut/copy/paste,
 undo/redo (typing bursts coalesce), bold/italic/underline (also for upcoming typing), Heading 1–3,

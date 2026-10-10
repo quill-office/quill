@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quill Sheets</title>
+<style>
+  :root { --bg:#e9ebef; --bar:#fff; --fg:#1f2328; --muted:#6b7280; --line:#d0d7de; --accent:#2563eb; --hover:#f0f3f7; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14161a; --bar:#1e2127; --fg:#e6e8eb; --muted:#9aa1ab; --line:#363b45; --accent:#6ea0ff; --hover:#2a2e37; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height:100%; margin:0; }
+  body { display:flex; flex-direction:column; background:var(--bg); color:var(--fg); font:14px system-ui, sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:6px; align-items:center; padding:8px 16px; background:var(--bar); border-bottom:1px solid var(--line); }
+  header strong { margin-right:8px; }
+  header a { color:var(--accent); text-decoration:none; margin-right:6px; }
+  .sep { width:1px; align-self:stretch; background:var(--line); margin:0 4px; }
+  button, select { font:inherit; color:inherit; background:none; border:1px solid transparent; border-radius:6px; padding:4px 9px; cursor:pointer; min-width:30px; }
+  select { border-color:var(--line); background:var(--bar); }
+  button:hover { background:var(--hover); }
+  button:disabled { opacity:.35; cursor:default; background:none; }
+  button[aria-pressed="true"] { background:color-mix(in srgb, var(--accent) 22%, transparent); border-color:var(--accent); }
+  button:focus-visible, select:focus-visible, input:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  .color input { width:28px; height:26px; padding:0; border:1px solid var(--line); border-radius:6px; background:none; cursor:pointer; }
+  #formula { display:flex; gap:8px; align-items:center; padding:6px 16px; background:var(--bar); border-bottom:1px solid var(--line); }
+  #name { width:110px; text-align:center; }
+  #fx { flex:1; }
+  #formula input { font:inherit; color:inherit; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:4px 8px; }
+  #formula span { color:var(--muted); font-style:italic; }
+  #scroller { position:relative; flex:1; min-height:0; overflow:auto; background:#fff; }
+  #wrap { position:relative; }
+  #grid { position:sticky; top:0; left:0; display:block; cursor:cell; touch-action:none; }
+  #cell { pointer-events:none; position:absolute; margin:0; padding:0 4px; border:0; outline:0; opacity:0; background:#fff; color:#1f2328; font:13px system-ui, -apple-system, "Segoe UI", sans-serif; z-index:2; }
+  #cell.editing { pointer-events:auto; opacity:1; border:2px solid var(--accent); padding:0 3px; }
+  footer { display:flex; gap:16px; justify-content:space-between; padding:4px 16px; background:var(--bar); border-top:1px solid var(--line); color:var(--muted); font-size:12px; }
+  .sr-only { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
+</style>
+</head>
+<body>
+<header role="toolbar" aria-label="Spreadsheet tools">
+  <strong>Quill Sheets</strong>
+  <a href="../index.html" title="Open Quill Write">Write</a>
+  <button id="new" title="New spreadsheet">New</button>
+  <button id="open" title="Open a CSV file">Open</button>
+  <button id="save" title="Save as CSV">Save</button>
+  <span class="sep"></span>
+  <button id="undo" title="Undo (Ctrl+Z)" aria-label="Undo">↶</button>
+  <button id="redo" title="Redo (Ctrl+Shift+Z)" aria-label="Redo">↷</button>
+  <span class="sep"></span>
+  <button id="bold" title="Bold (Ctrl+B)"><b>B</b></button>
+  <button id="italic" title="Italic (Ctrl+I)"><i>I</i></button>
+  <button data-align="left" title="Align left" aria-label="Align left">⯇</button>
+  <button data-align="center" title="Center" aria-label="Center">≡</button>
+  <button data-align="right" title="Align right" aria-label="Align right">⯈</button>
+  <label class="color" title="Text colour"><input id="color" type="color" value="#1f2328" aria-label="Text colour"></label>
+  <label class="color" title="Fill colour"><input id="fill" type="color" value="#fff2a8" aria-label="Fill colour"></label>
+  <button id="fillClear" title="Remove fill colour" aria-label="Remove fill colour">⌫</button>
+  <span class="sep"></span>
+  <select id="numfmt" title="Number format" aria-label="Number format">
+    <option value="general">General</option>
+    <option value="number">Number</option>
+    <option value="integer">Integer</option>
+    <option value="percent">Percent</option>
+    <option value="currency">Currency</option>
+  </select>
+  <button id="decMore" title="More decimal places" aria-label="More decimals">.0→</button>
+  <button id="decLess" title="Fewer decimal places" aria-label="Fewer decimals">←.0</button>
+  <span class="sep"></span>
+  <button id="fillDown" title="Fill down (Ctrl+D)">Fill ↓</button>
+  <button id="fillRight" title="Fill right (Ctrl+R)">Fill →</button>
+  <button id="insRow" title="Insert rows above the selection">+ Row</button>
+  <button id="insCol" title="Insert columns left of the selection">+ Col</button>
+  <button id="delRow" title="Delete the selected rows">− Row</button>
+  <button id="delCol" title="Delete the selected columns">− Col</button>
+</header>
+<div id="formula">
+  <input id="name" aria-label="Name box" spellcheck="false" autocomplete="off">
+  <span>ƒx</span>
+  <input id="fx" aria-label="Formula bar" spellcheck="false" autocomplete="off">
+</div>
+<div id="scroller"><div id="wrap"><canvas id="grid" role="grid" aria-label="Spreadsheet grid. Arrow keys move, type to edit."></canvas><input id="cell" aria-label="Cell editor" autocomplete="off" spellcheck="false" autocapitalize="off"></div></div>
+<footer><span id="sheetinfo">Sheet1</span><span id="stats"></span></footer>
+<div id="announce" class="sr-only" aria-live="polite"></div>
+<script type="module" src="./main.js"></script>
+</body>
+</html>

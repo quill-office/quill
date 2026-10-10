@@ -1,6 +1,9 @@
 import init, { Editor } from "./pkg/quill_wasm.js";
 import { files } from "./files.js";
 
+// The spreadsheet app is a separate page; the desktop shell does not host it yet.
+if (!files.isNative) document.getElementById("sheetsLink").hidden = false;
+
 const FONT_FAMILY = "Georgia, 'Times New Roman', serif";
 // Office documents name fonts that browsers often lack; fall back by style.
 const MONO = /^(courier|consolas|menlo|monaco|lucida console|cascadia|source code|fira (code|mono))/i;

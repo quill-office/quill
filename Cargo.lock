@@ -147,6 +147,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "quill-calc"
+version = "0.1.0"
+
+[[package]]
 name = "quill-core"
 version = "0.1.0"
 dependencies = [
@@ -178,6 +182,16 @@ dependencies = [
  "miniz_oxide",
  "quill-core",
  "quill-layout",
+]
+
+[[package]]
+name = "quill-sheets-wasm"
+version = "0.1.0"
+dependencies = [
+ "quill-calc",
+ "serde",
+ "serde-wasm-bindgen",
+ "wasm-bindgen",
 ]
 
 [[package]]
